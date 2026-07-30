@@ -1,6 +1,6 @@
 import { defineTool } from "eve/tools";
 import { z } from "zod";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { open, readdir, readFile, stat } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { createRequire } from "node:module";
@@ -20,6 +20,8 @@ const VAULT = () => process.env.ASSISTANT_VAULT_DIR || "vault";
 const IGNORE_DIRS = new Set([".git", "node_modules", ".next", "dist", ".cache", ".graph", ".index", ".trash"]);
 const DEFAULT_DIRS = ["cards", "summaries", "weekly", "monthly", "yearly"];
 const MAX_SNIPPET = 240;
+const MAX_DOC_READ_BYTES = 32 * 1024;
+const MAX_DOC_BODY_CHARS = 4_000;
 
 interface Doc {
   // КОНТРАКТ ПУТЕЙ: vault-relative, без ведущего "./" — ровно в таком виде путь уезжает
@@ -38,6 +40,17 @@ interface Doc {
 // Поля фронтматтера, несущие искомый смысл структурированных карточек (контакты/проекты).
 // Индексируем их отдельной колонкой с высоким весом — иначе поиск по имени/компании из
 // фронтматтера промахивается (в body их может не быть).
+async function readSearchablePrefix(file: string): Promise<string> {
+  const handle = await open(file, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(MAX_DOC_READ_BYTES);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
 const META_FIELDS = [
   "name", "company", "role", "description", "handle", "aliases", "aka", "title", "platform",
   "industry", "domain",
@@ -91,7 +104,7 @@ export async function loadDocs(scopeDirs: string[]): Promise<Doc[]> {
   for (const file of files) {
     let text: string;
     try {
-      text = await readFile(file, "utf8");
+      text = await readSearchablePrefix(file);
     } catch {
       continue;
     }
@@ -104,7 +117,7 @@ export async function loadDocs(scopeDirs: string[]): Promise<Doc[]> {
       path: rel,
       title: rel.replace(/\.md$/, "").split("/").pop() || rel,
       meta,
-      body: body.slice(0, 8000),
+      body: body.slice(0, MAX_DOC_BODY_CHARS),
       tags: fm.tags || "",
       status: (fm.status || "").toLowerCase(),
       confidence: (fm.confidence || "").toUpperCase(),

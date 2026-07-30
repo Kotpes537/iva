@@ -1,0 +1,21 @@
+[Unit]
+Description=Telegram Local Bot API Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/iva
+EnvironmentFile=/root/iva/.env
+ExecStartPre=/usr/bin/mkdir -p /root/iva/data/telegram-bot-api/tmp
+ExecStart=/usr/local/bin/telegram-bot-api --api-id=${TELEGRAM_API_ID} --api-hash=${TELEGRAM_API_HASH} --local --http-port=8081 --dir=/root/iva/data/telegram-bot-api --temp-dir=/root/iva/data/telegram-bot-api/tmp
+Restart=on-failure
+RestartSec=5
+MemoryHigh=384M
+MemoryMax=512M
+CPUQuota=100%
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

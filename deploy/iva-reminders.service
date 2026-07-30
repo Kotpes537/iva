@@ -1,0 +1,14 @@
+[Unit]
+Description=Iva Telegram reminder delivery
+Wants=network-online.target
+After=network-online.target telegram-bot-api.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/iva
+EnvironmentFile=/root/iva/.env
+Environment=PATH=/root/.nvm/versions/node/v24.17.0/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/root/.nvm/versions/node/v24.17.0/bin/node --env-file=.env scripts/reminders/dispatch.mjs
+Nice=10
+CPUQuota=25%
+MemoryMax=128M

@@ -124,6 +124,60 @@ def main() -> None:
 
     install_guardrails(client)
 
+    # TOOL-LEVEL CHAT ALLOWLIST. This does not inspect HTTP request bodies: doing
+    # that breaks MCP's streamable transport and can spin CPU. Instead, only the
+    # required tools exist, and every content tool rejects a non-allowlisted chat.
+    def allowed_chat_ids() -> set[str]:
+        raw = os.getenv("TELEGRAM_MCP_ALLOWED_CHAT_IDS", "")
+        return {value.strip() for value in raw.replace(";", ",").split(",") if value.strip()}
+
+    discovery = os.getenv("TELEGRAM_MCP_DISCOVERY_ONLY", "0") == "1"
+    content_tools = {
+        "get_history", "list_messages", "get_messages", "get_message_context",
+        "search_messages", "get_pinned_messages", "get_message_link",
+        "get_media_info", "download_media", "list_inline_buttons",
+        "get_message_read_by",
+    }
+    onboarding_tools = {"login_status", "qr_login_start", "qr_login_status", "qr_login_password"}
+    permitted_tools = set(onboarding_tools) | set(content_tools)
+    if discovery:
+        permitted_tools |= {"get_chats", "list_chats"}
+
+    for tool in list(mcp._tool_manager.list_tools()):
+        if tool.name not in permitted_tools:
+            mcp.remove_tool(tool.name)
+
+    for name in content_tools:
+        tool = mcp._tool_manager.get_tool(name)
+        if not tool:
+            continue
+        original = tool.fn
+
+        async def guarded(*args, __original=original, **kwargs):
+            chat_id = kwargs.get("chat_id")
+            if chat_id is None or str(chat_id) not in allowed_chat_ids():
+                raise RuntimeError("Telegram MCP: chat is not in the configured allowlist")
+            # Upstream accepts no account for a single session, but rejects an empty
+            # string emitted by some MCP clients. Normalize it to the sole account.
+            if kwargs.get("account") == "":
+                kwargs["account"] = "default"
+            # A bounded response is a hard safety boundary for the 2 GB VPS.
+            # Reviews must never pull a whole chat into the model context.
+            if name in {"get_history", "list_messages", "search_messages"}:
+                try:
+                    kwargs["limit"] = min(max(1, int(kwargs.get("limit", 20))), 30)
+                except (TypeError, ValueError):
+                    kwargs["limit"] = 20
+            elif name == "get_messages":
+                try:
+                    kwargs["page_size"] = min(max(1, int(kwargs.get("page_size", 20))), 30)
+                except (TypeError, ValueError):
+                    kwargs["page_size"] = 20
+            return await __original(*args, **kwargs)
+
+        tool.fn = guarded
+
+
     import uvicorn
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.responses import JSONResponse
