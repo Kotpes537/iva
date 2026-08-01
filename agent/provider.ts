@@ -13,12 +13,17 @@ const PROVIDER = process.env.MODEL_PROVIDER ?? "ollama";
 
 const PROVIDERS = {
   ollama: {
-    baseURL: "https://ollama.com/v1",
+    // OLLAMA_BASE_URL — не пользовательская настройка, а шов для тестов: replica-смоук
+    // подставляет сюда локальный mock-провайдер (scripts/lib/mock-openai-server.mjs).
+    baseURL: process.env.OLLAMA_BASE_URL ?? "https://ollama.com/v1",
     apiKey: process.env.OLLAMA_API_KEY,
     textModel: process.env.OLLAMA_MODEL ?? "deepseek-v4-pro",
     contextWindow: Number(process.env.OLLAMA_CONTEXT_WINDOW ?? 131072),
     // Дешёвая мультимодалка того же провайдера (проверено на проде: принимает image_url, http 200).
-    visionModel: "gemma3:12b",
+    // Ollama Cloud снимает теги с раздачи: gemma3:12b отвечает 410 "retired at 2026-07-15" —
+    // заменён на gemma4:31b (проверено 2026-07-28). Текстовые модели (deepseek, glm, gpt-oss)
+    // отдают 400 "does not support image input", так что подменять vision на них нельзя.
+    visionModel: "gemma4:31b",
   },
   opencode: {
     baseURL: "https://opencode.ai/zen/go/v1",
@@ -26,7 +31,10 @@ const PROVIDERS = {
     // Эндпоинт ждёт bare-ID — срезаем внутренний UI-префикс "opencode-go/" из дефолта и старых .env.
     textModel: (process.env.OPENCODE_MODEL ?? "deepseek-v4-pro").replace(/^opencode-go\//, ""),
     contextWindow: Number(process.env.OPENCODE_CONTEXT_WINDOW ?? 131072),
-    visionModel: "gemini-3-flash",
+    // gemini-3-flash выпал из каталога Go (401 "Model gemini-3-flash is not supported") — теперь
+    // qwen3.7-plus: отвечает 200 и кладёт описание в message.content. У glm-5.2/minimax-m3 текст
+    // уходит в reasoning, у mimo-v2.5 content пустой — vision.ts читает только content.
+    visionModel: "qwen3.7-plus",
   },
   openrouter: {
     baseURL: "https://openrouter.ai/api/v1",
@@ -35,7 +43,7 @@ const PROVIDERS = {
     // Дефолт — лишь заглушка на случай ручного .env; мастер всегда перезапишет живой проверкой.
     textModel: process.env.OPENROUTER_MODEL ?? "openai/gpt-5.1",
     contextWindow: Number(process.env.OPENROUTER_CONTEXT_WINDOW ?? 131072),
-    // Дешёвая гарантированно-мультимодальная модель для картинок (как gemini-3-flash у opencode):
+    // Дешёвая гарантированно-мультимодальная модель для картинок (как qwen3.7-plus у opencode):
     // vision работает независимо от выбранной текстовой модели (та может быть text-only).
     visionModel: "google/gemini-2.5-flash",
   },

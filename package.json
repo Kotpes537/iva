@@ -1,6 +1,6 @@
 {
   "name": "iva",
-  "version": "0.3.4",
+  "version": "0.3.8",
   "type": "module",
   "bin": {
     "iva": "bin/iva.mjs"
@@ -17,6 +17,7 @@
     "dev": "eve dev",
     "start": "eve start",
     "init-vault": "node scripts/init-vault.mjs",
+    "replica": "node scripts/replica-smoke.mjs",
     "digest": "node scripts/daily-digest.ts",
     "poll": "node --env-file=.env scripts/telegram-poll.mjs",
     "memory": "node --env-file=.env scripts/memory/rollup.ts",
@@ -31,10 +32,10 @@
     "@ai-sdk/openai-compatible": "^3.0.11",
     "@vercel/connect": "0.2.2",
     "ai": "7.0.39",
-    "croner": "^10.0.1",
-    "eve": "0.27.8",
+    "eve": "0.27.13",
     "just-bash": "^3.0.0",
-    "zod": "4.4.3"
+    "zod": "4.4.3",
+    "croner": "^10.0.1"
   },
   "devDependencies": {
     "@types/node": "24.x",

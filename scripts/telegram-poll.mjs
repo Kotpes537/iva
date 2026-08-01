@@ -8,7 +8,7 @@
 // so we fetch updates from Telegram ourselves (getUpdates, long-poll) and POST them to
 // the local eve route with the same secret — Telegram sees an ordinary bot, no proxy needed.
 // The channel/agent are unchanged. Webhook and polling are mutually exclusive → deleteWebhook on start.
-import { readFile, writeFile, mkdir, rename, rm, readdir, stat } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rm, readdir, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { join, dirname } from "node:path";
@@ -21,19 +21,62 @@ import {
   EFFORTS,
   fetchModelOptions,
   checkKey,
-  providerFallbackReasoningLevels,
   providerSupportsReasoning,
 } from "./lib/model-catalog.mjs";
+import {
+  ModelValidationError,
+  validateModelSelection,
+} from "./lib/model-validation.mjs";
 import { getAccessToken, runDeviceCodeLogin } from "./lib/codex-oauth.mjs";
 import { compactNumber, modelSummary } from "./lib/model-summary.mjs";
 import { acquireUpdateLock, releaseUpdateLock } from "./lib/update-safety.mjs";
 import { inspectUpstream, markVersionNotified, updateOffer } from "./lib/update-check.mjs";
 // ESC-остановка: канал пишет в data/run-status.d, идёт ли сейчас ход по чату;
 // мост по нему буферизует входящие (см. очередь ниже) и обслуживает /stop.
-import { getChatStatus, isRunning, setChatStatus } from "./lib/run-status.mjs";
+import {
+  getChatStatus,
+  isRunning,
+  listChatStatuses,
+  RUN_STALE_MS,
+  setChatStatus,
+  setChatStatusIf,
+} from "./lib/run-status.mjs";
 import { classifyDeliverStatus } from "./lib/deliver-policy.mjs";
 import { alreadyDelivered, parseOffsetFile, serializeOffsetFile } from "./lib/offset-store.mjs";
 import { continuationTokenForControl, requestTelegramReset } from "./lib/telegram-reset.mjs";
+import {
+  clearTelegramResetIntent,
+  loadTelegramResetIntents,
+  persistTelegramResetIntent,
+} from "./lib/telegram-reset-intent.mjs";
+import {
+  addTelegramQueueReceipt,
+  TELEGRAM_ACCEPTANCE_KIND_HEADER,
+  TELEGRAM_ACCEPTANCE_ROUTE,
+} from "./lib/telegram-acceptance.mjs";
+import {
+  acknowledgeQueueHead,
+  clearQueueFileKey,
+  enqueueQueueFile,
+  isReplyToBot,
+  loadQueueFile,
+  materializeQueueItem,
+  migrateQueueFile,
+  queueCount,
+  queueHead,
+  queueKeys,
+  shouldQueueBusyUpdate,
+  TELEGRAM_QUEUE_FATAL_DURABILITY,
+  writeQueueFileAtomic,
+} from "./lib/telegram-queue.mjs";
+import {
+  COLLECT_QUIET_MS,
+  collectorOffer,
+  collectorPending,
+  collectorRestore,
+  collectorTakeExpired,
+  createCollector,
+} from "./lib/telegram-collect.mjs";
 // Двуязычие: единый источник языка (getLang) + одна таблица команд (COMMANDS) для /help
 // и синего командного меню Telegram. tr(en, ru) — функция (язык не замораживаем в const).
 import { getLang, tr, helpText, botCommands } from "./lib/i18n.mjs";
@@ -47,6 +90,7 @@ const NODE = process.execPath;
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const BOT_USER_ID = /^(\d+):/.exec(TOKEN ?? "")?.[1] ?? null;
+const BOT_USERNAME = process.env.TELEGRAM_BOT_USERNAME ?? "my_bot";
 const SECRET = process.env.TELEGRAM_WEBHOOK_SECRET_TOKEN;
 const PORT = process.env.IVA_PORT ?? "8723";
 const HOST = (process.env.ASSISTANT_HOST ?? `http://127.0.0.1:${PORT}`).replace(/\/$/, "");
@@ -57,12 +101,33 @@ const DATA_DIR = DATA_DIR_RAW.startsWith("/") ? DATA_DIR_RAW : join(ROOT, DATA_D
 const ENV_PATH = join(ROOT, ".env");
 const DATA_DIR_ABS = DATA_DIR;
 const ROUTE = `${HOST}/eve/v1/telegram`;
+const ACCEPTANCE_ROUTE = `${HOST}${TELEGRAM_ACCEPTANCE_ROUTE}`;
 const RESET_ROUTE = `${ROUTE}/reset`;
 const API = `https://api.telegram.org/bot${TOKEN}`;
 const OFFSET_FILE = join(DATA_DIR, "telegram-offset.json");
+// Acceptance returns 204 only after the turn starts. Ninety seconds is deliberately
+// generous so no legitimate start should hit the deadline, while a wedged eve cannot
+// block the bridge's single polling loop forever.
+const configuredDirectAcceptanceTimeoutMs = Number(
+  process.env.TELEGRAM_DIRECT_ACCEPTANCE_TIMEOUT_MS,
+);
+const DIRECT_ACCEPTANCE_TIMEOUT_MS =
+  Number.isInteger(configuredDirectAcceptanceTimeoutMs) &&
+  configuredDirectAcceptanceTimeoutMs > 0 &&
+  configuredDirectAcceptanceTimeoutMs <= 4_294_967_295
+    ? configuredDirectAcceptanceTimeoutMs
+    : 90_000;
 // Pause between updates of the SAME chat: we give eve time to park the turn and register
 // the continuation hook, otherwise a burst starts a second run on the same token → HookConflictError.
 const SETTLE_MS = Number(process.env.TELEGRAM_POLL_SETTLE_MS ?? 1500);
+const rawCollectQuietMs = Number(
+  process.env.TELEGRAM_COLLECT_QUIET_MS ?? COLLECT_QUIET_MS,
+);
+const configuredCollectQuietMs =
+  Number.isFinite(rawCollectQuietMs) && rawCollectQuietMs >= 0
+    ? rawCollectQuietMs
+    : COLLECT_QUIET_MS;
+const messageCollector = createCollector({ quietMs: configuredCollectQuietMs });
 const UPDATE_JOB_TTL_MS = 6 * 60 * 60 * 1000;
 
 // Trusted IDs — only they are allowed control commands (/restart etc.).
@@ -184,26 +249,105 @@ async function downloadTelegramFile(fileId, maxBytes) {
 // не даёт надёжного признака «апдейт битый навсегда» (тот же 409 может быть временным
 // конфликтом хука), поэтому и эти статусы ретраятся, но ОГРАНИЧЕННО: DROP_ATTEMPTS
 // попыток (~5 минут), затем апдейт выбрасывается, чтобы не заморозить все чаты.
-// Returns true when eve accepted the update, false when it was dropped.
+// Direct delivery keeps that policy. Durable queue replay opts into one bounded attempt
+// per drain pass: its on-disk head is the retry mechanism, so one bad chat cannot starve
+// other queues or Telegram polling.
+// Returns true when eve accepted the update, false when it was dropped or retained.
 const CONFIG_RETRY_MS = 60_000;
 const DROP_ATTEMPTS = 30;
-async function deliver(update) {
+async function deliver(
+  update,
+  {
+    route: requestedRoute,
+    acceptedStatus,
+    queueReceipt: requestedQueueReceipt,
+    retry = true,
+    retryAcceptanceTimeout = retry,
+    timeoutMs,
+    onAcceptanceFailure,
+  } = {},
+) {
+  // The authored acceptance wrapper observes onMessage/send(), but not
+  // onCallbackQuery. Message updates therefore use the stronger route by default,
+  // while genuine and synthetic callbacks keep the original webhook path.
+  const route =
+    requestedRoute ??
+    (update?.message && !update?.callback_query ? ACCEPTANCE_ROUTE : ROUTE);
+  const expectsAcceptance =
+    acceptedStatus !== undefined || route === ACCEPTANCE_ROUTE;
+  const expectedStatus =
+    acceptedStatus ?? (expectsAcceptance ? 204 : undefined);
+  const queueReceipt =
+    requestedQueueReceipt ?? (expectsAcceptance && Boolean(update?.message));
+  const outgoing = queueReceipt ? addTelegramQueueReceipt(update) : update;
+  const reportAcceptanceFailure = async (details) => {
+    if (!onAcceptanceFailure) return;
+    try {
+      await onAcceptanceFailure(details);
+    } catch (error) {
+      log("deliver: direct acceptance failure cleanup failed:", error.message);
+    }
+  };
   for (let attempt = 1; ; attempt++) {
     let wait = Math.min(15000, 1000 * attempt);
     try {
-      const res = await fetch(ROUTE, {
+      const res = await fetch(route, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "X-Telegram-Bot-Api-Secret-Token": SECRET,
         },
-        body: JSON.stringify(update),
+        body: JSON.stringify(outgoing),
+        ...(timeoutMs === undefined ? {} : { signal: AbortSignal.timeout(timeoutMs) }),
       });
-      if (res.ok) return true;
-      const cls = classifyDeliverStatus(res.status);
+      const acceptanceKind = expectsAcceptance
+        ? res.headers.get(TELEGRAM_ACCEPTANCE_KIND_HEADER)
+        : null;
+      if (
+        res.ok &&
+        (expectedStatus === undefined || res.status === expectedStatus) &&
+        (
+          !expectsAcceptance ||
+          acceptanceKind === "turn" ||
+          acceptanceKind === "handled"
+        )
+      ) {
+        return acceptanceKind === "handled" ? "handled" : true;
+      }
+      if (res.ok) {
+        if (expectsAcceptance) {
+          await reportAcceptanceFailure({
+            attempt,
+            kind: "protocol",
+            status: res.status,
+          });
+        }
+        if (!retry) {
+          log(
+            `deliver: acceptance route replied ${res.status} without a valid acceptance receipt; queue head retained`,
+          );
+          return false;
+        }
+      }
+      if (expectsAcceptance && res.status === 503) {
+        await reportAcceptanceFailure({
+          attempt,
+          kind: "dispatch",
+          status: res.status,
+        });
+      }
+      const cls = classifyDeliverStatus(res.status, {
+        acceptance: expectsAcceptance,
+      });
+      if (!retry) {
+        log(`deliver: eve replied ${res.status}; queue head retained for a later pass`);
+        return false;
+      }
       if (cls === "drop") {
         if (attempt < DROP_ATTEMPTS) {
-          log(`deliver: eve replied ${res.status} (attempt ${attempt}/${DROP_ATTEMPTS}) — retrying (may be transient)`);
+          log(
+            `deliver: eve replied ${res.status} (attempt ${attempt}/${DROP_ATTEMPTS}) — retrying (may be transient)`,
+          );
           await sleep(wait);
           continue;
         }
@@ -221,6 +365,42 @@ async function deliver(update) {
         log(`deliver: eve replied ${res.status} (attempt ${attempt}) — retrying`);
       }
     } catch (e) {
+      const acceptanceTimeout =
+        expectsAcceptance &&
+        (e?.name === "TimeoutError" || e?.name === "AbortError");
+      if (acceptanceTimeout) {
+        await reportAcceptanceFailure({
+          attempt,
+          kind: "timeout",
+          status: "timeout",
+        });
+      }
+      if (!retry) {
+        log(`deliver: eve unavailable (${e.message}); queue head retained for a later pass`);
+        return false;
+      }
+      if (acceptanceTimeout && !retryAcceptanceTimeout) {
+        // A timed-out POST may still start later. Re-posting it could duplicate the
+        // turn, so direct acceptance timeouts are definitive and never retried.
+        log(
+          `deliver: direct acceptance timed out after ${timeoutMs}ms; rejecting update ${update.update_id} without retry`,
+        );
+        return false;
+      }
+      if (acceptanceTimeout) {
+        if (attempt < DROP_ATTEMPTS) {
+          log(
+            `deliver: acceptance timed out (attempt ${attempt}/${DROP_ATTEMPTS}) — retrying`,
+          );
+          await sleep(wait);
+          continue;
+        }
+        log(
+          `deliver: acceptance timed out ${DROP_ATTEMPTS} times — DROPPING update ${update.update_id}`,
+        );
+        await notifyDeliverProblem("drop", "timeout");
+        return false;
+      }
       log(`deliver: eve unavailable (${e.message}, attempt ${attempt}) — waiting for server`);
     }
     await sleep(wait);
@@ -264,16 +444,25 @@ const lastDeliverAt = new Map();
 // Доставка с пейсингом: выдержать SETTLE_MS с последней доставки в этот чат, доставить,
 // отметить время. ЕДИНЫЙ путь для главного цикла и для меню (deps.deliver) — оба делят
 // lastDeliverAt, поэтому доставка из меню сдвигает паузу для следующего реального сообщения.
-async function pacedDeliver(update) {
+async function pacedDeliver(update, options) {
+  const deadline =
+    options?.timeoutMs === undefined ? null : Date.now() + Math.max(0, options.timeoutMs);
   const key = chatKey(update);
   if (key !== null && SETTLE_MS > 0) {
     const prev = lastDeliverAt.get(key);
     if (prev !== undefined) {
       const wait = SETTLE_MS - (Date.now() - prev);
-      if (wait > 0) await sleep(wait);
+      if (wait > 0) {
+        if (deadline !== null && wait >= deadline - Date.now()) return false;
+        await sleep(wait);
+      }
     }
   }
-  const accepted = await deliver(update); // wait for delivery — ordered and lossless
+  const deliverOptions =
+    deadline === null
+      ? options
+      : { ...options, timeoutMs: Math.max(1, Math.floor(deadline - Date.now())) };
+  const accepted = await deliver(update, deliverOptions); // wait for delivery — ordered and lossless
   if (key !== null) lastDeliverAt.set(key, Date.now());
   return accepted; // false = апдейт выброшен как битый, eve его НЕ получила
 }
@@ -305,81 +494,44 @@ async function edit(chatId, messageId, text, replyMarkup) {
 const sc = (...args) =>
   new Promise((resolve) => execFile("systemctl", ["--user", ...args], (err) => resolve(!err)));
 
-// ── ESC-stop message queue (Claude Code semantics) ─────────────────────────
-// While a turn is running for a chat, ordinary message updates are NOT delivered to eve:
-// they are appended to data/telegram-queue.json and acknowledged with a 👀 reaction.
-// eve would otherwise buffer them in-memory and auto-process the batch as soon as the
-// turn parks (its docs call that drain best-effort) — we want the stricter semantics:
-// queued messages enter the context only WITH the next fresh message. When the agent is
-// idle again, the next message carries the queue along as update.message.iva_buffered
-// (the channel turns it into context lines).
+// ── Durable busy-time FIFO ──────────────────────────────────────────────────
+// Each accepted Telegram update is written as a versioned item (including update_id and
+// the untouched raw update) before its Telegram offset advances. The bridge then replays
+// one head per idle chat/topic. It removes that head only after Eve accepts the webhook:
+// a crash can duplicate the head, but cannot lose it or reorder later items around it.
 const QUEUE_FILE = join(DATA_DIR, "telegram-queue.json");
+const RESET_INTENT_DIR = join(DATA_DIR, "telegram-reset-intents");
+const queueSettleUntil = new Map();
+const queueInFlight = new Map();
+const queueDrainRotation = { afterKey: null };
+const undrainableLegacyLogged = new Set();
+const QUEUE_DELIVERY_TIMEOUT_MS = 5_000;
+const QUEUE_DRAIN_BUDGET_MS = 5_000;
+
+function statusGeneration(status) {
+  return Number.isSafeInteger(status?.generation) && status.generation >= 0
+    ? status.generation
+    : 0;
+}
 
 export async function loadQueue({ strict = false } = {}) {
-  let raw;
-  try {
-    raw = await readFile(QUEUE_FILE, "utf8");
-  } catch (error) {
-    if (error?.code === "ENOENT") return {};
-    throw error;
+  const loaded = await loadQueueFile(QUEUE_FILE, { strict });
+  if (loaded.quarantined) {
+    log(`damaged Telegram queue moved to ${loaded.quarantined}:`, loaded.error.message);
   }
-  try {
-    const queue = JSON.parse(raw);
-    if (typeof queue !== "object" || queue === null || Array.isArray(queue)) {
-      throw new Error(`${QUEUE_FILE} does not contain a JSON object`);
-    }
-    return queue;
-  } catch (error) {
-    if (strict) throw error;
-    const backup = `${QUEUE_FILE}.corrupt-${Date.now()}-${randomBytes(4).toString("hex")}`;
-    // Ordinary polling must stay live, but returning {} before the damaged
-    // bytes are safely moved would let the next save overwrite evidence/data.
-    await rename(QUEUE_FILE, backup);
-    log(`damaged Telegram queue moved to ${backup}:`, error.message);
-    return {};
-  }
+  return loaded.document;
 }
 
-export async function writeQueueAtomic(
-  queue,
-  {
-    writeFileImpl = writeFile,
-    renameImpl = rename,
-    rmImpl = rm,
-    nonce = randomBytes(8).toString("hex"),
-  } = {},
-) {
-  await mkdir(DATA_DIR, { recursive: true });
-  const tmp = `${QUEUE_FILE}.tmp-${process.pid}-${nonce}`;
-  try {
-    await writeFileImpl(tmp, JSON.stringify(queue), {
-      encoding: "utf8",
-      flag: "wx",
-      mode: 0o600,
-    });
-    await renameImpl(tmp, QUEUE_FILE);
-  } finally {
-    await rmImpl(tmp, { force: true }).catch(() => {});
-  }
-}
-
-async function saveQueue(q) {
-  try {
-    await writeQueueAtomic(q);
-  } catch (e) {
-    log("queue save failed:", e.message);
-  }
+export async function writeQueueAtomic(queue, options = {}) {
+  await writeQueueFileAtomic(QUEUE_FILE, queue, options);
 }
 
 // A scoped reset intentionally discards only messages queued for this chat/topic.
 // Other conversations keep both their queues and their Eve histories.
 async function clearChatQueue(chatKey) {
-  const q = await loadQueue({ strict: true });
-  if (!(chatKey in q)) return;
-  delete q[chatKey];
   // Reset cleanup must fail loudly: completeScopedResetState keeps the old
-  // running status until this atomic rename succeeds.
-  await writeQueueAtomic(q);
+  // running status until this atomic rewrite succeeds.
+  await clearQueueFileKey(QUEUE_FILE, chatKey);
 }
 
 export async function completeScopedResetState(
@@ -405,28 +557,566 @@ export async function completeScopedResetState(
     sessionId: null,
     turnId: null,
     statusMessageId: null,
+    ingressId: null,
+    ingressAt: null,
+    statusAt: null,
+    turnAt: null,
+    firstOutputAt: null,
+    latencyLogged: null,
     wasCancelled: null,
     resetAt: Date.now(),
   });
 }
 
-// One queued message → one context line. Media can't be re-fed later (the channel
-// processes files only on live delivery), so it degrades to a placeholder + caption.
-const MEDIA_KEYS = [
-  "photo", "voice", "audio", "video", "video_note",
-  "animation", "sticker", "document", "location", "contact", "poll",
-];
-function bufferEntryOf(msg) {
-  const text = (msg.text || "").trim();
-  if (text) return text;
-  const kind = MEDIA_KEYS.find((k) => msg[k] !== undefined);
-  const caption = (msg.caption || "").trim();
-  if (!kind) return caption || null;
-  const note = tr(
-    `[${kind} — sent while a turn was running; the attachment wasn't processed, ask to resend it if you need it]`,
-    `[${kind} — прислано пока шёл ход; вложение не обработано, попроси прислать заново, если оно нужно]`,
+export async function persistPrivateResetIntent(chatKey, continuationToken) {
+  return persistTelegramResetIntent(RESET_INTENT_DIR, chatKey, continuationToken);
+}
+
+export async function loadPrivateResetIntents() {
+  return loadTelegramResetIntents(RESET_INTENT_DIR);
+}
+
+export async function clearPrivateResetIntent(chatKey) {
+  return clearTelegramResetIntent(RESET_INTENT_DIR, chatKey);
+}
+
+const requestResetFromIntent = ({ continuationToken }) =>
+  requestTelegramReset({
+    url: RESET_ROUTE,
+    secret: SECRET,
+    continuationToken,
+  });
+
+export async function releaseScopedContinuation(
+  chatKey,
+  continuationToken,
+  { requestResetImpl = requestResetFromIntent } = {},
+) {
+  try {
+    await requestResetImpl({ chatKey, continuationToken });
+  } catch (error) {
+    error.resetPhase = "remote";
+    throw error;
+  }
+}
+
+export async function performScopedReset(
+  chatKey,
+  continuationToken,
+  {
+    clearQueue = false,
+    persistIntentImpl = persistPrivateResetIntent,
+    requestResetImpl = requestResetFromIntent,
+    completeStateImpl = completeScopedResetState,
+    clearIntentImpl = clearPrivateResetIntent,
+  } = {},
+) {
+  const intent = { chatKey, continuationToken };
+  if (clearQueue) {
+    try {
+      await persistIntentImpl(chatKey, continuationToken);
+    } catch (error) {
+      error.resetPhase = "intent";
+      throw error;
+    }
+  }
+  try {
+    await releaseScopedContinuation(chatKey, continuationToken, { requestResetImpl });
+  } catch (error) {
+    throw error;
+  }
+  try {
+    await completeStateImpl(chatKey, continuationToken, { clearQueue });
+  } catch (error) {
+    error.resetPhase = "cleanup";
+    throw error;
+  }
+  if (clearQueue) {
+    try {
+      await clearIntentImpl(chatKey);
+    } catch (error) {
+      error.resetPhase = "intent-cleanup";
+      throw error;
+    }
+  }
+}
+
+export async function reconcileScopedResetIntents({
+  loadIntentsImpl = loadPrivateResetIntents,
+  requestResetImpl = requestResetFromIntent,
+  completeStateImpl = completeScopedResetState,
+  clearIntentImpl = clearPrivateResetIntent,
+} = {}) {
+  const intents = await loadIntentsImpl();
+  for (const intent of intents) {
+    await requestResetImpl(intent);
+    await completeStateImpl(intent.chatKey, intent.continuationToken, { clearQueue: true });
+    await clearIntentImpl(intent.chatKey);
+  }
+  return intents.length;
+}
+
+function telegramTargetOf(chatKey) {
+  const separator = chatKey.indexOf(":");
+  if (separator <= 0) return null;
+  const chatId = chatKey.slice(0, separator);
+  if (!/^-?\d+$/.test(chatId)) return null;
+  const thread = chatKey.slice(separator + 1);
+  if (thread === "") return { chat_id: chatId };
+  if (!/^\d+$/.test(thread)) return null;
+  const messageThreadId = Number(thread);
+  if (!Number.isSafeInteger(messageThreadId) || messageThreadId <= 0) return null;
+  return { chat_id: chatId, message_thread_id: messageThreadId };
+}
+
+async function sendStaleRunNotice(chatKey, text) {
+  const target = telegramTargetOf(chatKey);
+  if (!target) throw new Error(`invalid Telegram chat key: ${chatKey}`);
+  const data = await tg("sendMessage", { ...target, text });
+  if (!data?.ok) throw new Error(data?.description || "sendMessage failed");
+}
+
+async function deleteStaleWorkingMessage(chatKey, messageId) {
+  const target = telegramTargetOf(chatKey);
+  if (!target) return;
+  await tg("deleteMessage", {
+    chat_id: target.chat_id,
+    message_id: messageId,
+  });
+}
+
+async function clearFailedDirectIngress(
+  chatKey,
+  {
+    baselineGeneration,
+    startedAt,
+    statusImpl = getChatStatus,
+    setStatusIfImpl = setChatStatusIf,
+    deleteMessageImpl = deleteStaleWorkingMessage,
+    now = Date.now,
+  },
+) {
+  const current = statusImpl(chatKey);
+  const observedAt = now();
+  if (
+    current?.status !== "running" ||
+    current.sessionId !== undefined ||
+    typeof current.ingressId !== "string" ||
+    !Number.isFinite(current.ingressAt) ||
+    current.ingressAt < startedAt ||
+    current.ingressAt > observedAt ||
+    statusGeneration(current) <= baselineGeneration
+  ) {
+    return false;
+  }
+
+  const cleared = setStatusIfImpl(
+    chatKey,
+    {
+      status: "running",
+      generation: current.generation,
+      updatedAt: current.updatedAt,
+      ingressId: current.ingressId,
+      sessionId: undefined,
+    },
+    {
+      status: "idle",
+      sessionId: null,
+      turnId: null,
+      statusMessageId: null,
+      ingressId: null,
+      ingressAt: null,
+      statusAt: null,
+      turnAt: null,
+      firstOutputAt: null,
+      latencyLogged: null,
+      wasCancelled: null,
+      resetAt: observedAt,
+    },
   );
-  return caption ? `${note} ${tr("Caption:", "Подпись:")} ${caption}` : note;
+  if (!cleared) return false;
+
+  if (current.statusMessageId !== undefined && current.statusMessageId !== null) {
+    try {
+      await deleteMessageImpl(chatKey, current.statusMessageId);
+    } catch {
+      // Failed-attempt working messages are removed best-effort, like stale ones.
+    }
+  }
+  return true;
+}
+
+export async function reapStaleRuns({
+  listStatusesImpl = listChatStatuses,
+  setStatusIfImpl = setChatStatusIf,
+  resetImpl = releaseScopedContinuation,
+  sendImpl = sendStaleRunNotice,
+  deleteMessageImpl = deleteStaleWorkingMessage,
+  now = Date.now,
+  inFlight = queueInFlight,
+  staleMs = RUN_STALE_MS,
+  trImpl = tr,
+  logImpl = log,
+} = {}) {
+  const safeLog = (...args) => {
+    try {
+      logImpl(...args);
+    } catch {
+      // Обслуживание протухших ходов не должно останавливать polling loop.
+    }
+  };
+
+  let records;
+  try {
+    records = await listStatusesImpl();
+  } catch (error) {
+    safeLog("stale run scan failed:", error.message);
+    return 0;
+  }
+
+  let reaped = 0;
+  for (const record of records) {
+    const key = record?.chatKey;
+    const status = record?.status;
+    if (
+      typeof key !== "string" ||
+      status?.status !== "running" ||
+      now() - (status.updatedAt ?? 0) <= staleMs ||
+      inFlight.has(key)
+    ) {
+      continue;
+    }
+
+    let flipped;
+    const reapedAt = now();
+    try {
+      flipped = setStatusIfImpl(
+        key,
+        {
+          status: "running",
+          generation: status.generation,
+          updatedAt: status.updatedAt,
+        },
+        {
+          status: "idle",
+          sessionId: null,
+          turnId: null,
+          statusMessageId: null,
+          ingressId: null,
+          ingressAt: null,
+          statusAt: null,
+          turnAt: null,
+          firstOutputAt: null,
+          latencyLogged: null,
+          wasCancelled: null,
+          resetAt: reapedAt,
+        },
+      );
+    } catch (error) {
+      safeLog(`stale run CAS failed for ${key}:`, error.message);
+      continue;
+    }
+    if (!flipped) continue;
+    reaped++;
+
+    if (
+      typeof status.continuationToken === "string" &&
+      status.continuationToken.length > 0
+    ) {
+      try {
+        await resetImpl(key, status.continuationToken);
+      } catch (error) {
+        safeLog(`stale run reset failed for ${key}:`, error.message);
+      }
+    } else {
+      safeLog(`stale run ${key} has no continuation token`);
+    }
+
+    try {
+      await sendImpl(
+        key,
+        trImpl(
+          "The previous turn was interrupted - repeat your request or use /new",
+          "Предыдущий ход оборвался - повтори запрос или /new",
+        ),
+      );
+    } catch (error) {
+      safeLog(`stale run notification failed for ${key}:`, error.message);
+    }
+
+    if (status.statusMessageId !== undefined && status.statusMessageId !== null) {
+      try {
+        await deleteMessageImpl(key, status.statusMessageId);
+      } catch {
+        // Старое статус-сообщение удаляется best-effort.
+      }
+    }
+  }
+  return reaped;
+}
+
+async function acknowledgeQueued(update, count) {
+  const message = update.message;
+  await tg("setMessageReaction", {
+    chat_id: message.chat.id,
+    message_id: message.message_id,
+    reaction: [{ type: "emoji", emoji: "👀" }],
+  }).catch((error) => log("reaction failed:", error.message));
+  await tg("sendMessage", {
+    chat_id: message.chat.id,
+    text: tr(
+      `Queued (${count}). I'll start it automatically when the current task finishes.`,
+      `В очереди: ${count}. Начну автоматически, когда текущая задача завершится.`,
+    ),
+    ...(message.message_thread_id === undefined
+      ? {}
+      : { message_thread_id: message.message_thread_id }),
+  }).catch((error) => log("queue status failed:", error.message));
+}
+
+async function deliverDirectUpdate(
+  update,
+  {
+    key = chatKey(update),
+    deliverImpl = pacedDeliver,
+    statusImpl = getChatStatus,
+    setStatusIfImpl = setChatStatusIf,
+    sendFailureImpl = sendStaleRunNotice,
+    deleteMessageImpl = deleteStaleWorkingMessage,
+    now = Date.now,
+    trImpl = tr,
+    logImpl = log,
+  } = {},
+) {
+  // The acceptance wrapper does not cover callback_query dispatch. Keeping this
+  // call option-free also preserves the old webhook path for real callbacks and
+  // the synthetic /stop callback.
+  if (!update.message || key === null) {
+    const accepted = await deliverImpl(update);
+    return accepted ? "delivered" : "rejected";
+  }
+
+  const startedAt = now();
+  const baselineGeneration = statusGeneration(statusImpl(key));
+  let acceptanceFailureReported = false;
+  let failureNotified = false;
+  const onAcceptanceFailure = async () => {
+    acceptanceFailureReported = true;
+    try {
+      await clearFailedDirectIngress(key, {
+        baselineGeneration,
+        startedAt,
+        statusImpl,
+        setStatusIfImpl,
+        deleteMessageImpl,
+        now,
+      });
+    } catch (error) {
+      logImpl(`direct delivery status cleanup failed for ${key}:`, error.message);
+    }
+
+    if (failureNotified) return;
+    failureNotified = true;
+    try {
+      await sendFailureImpl(
+        key,
+        trImpl(
+          "Couldn't process the message - repeat it or use /new",
+          "Не получилось обработать сообщение - повтори или /new",
+        ),
+      );
+    } catch (error) {
+      logImpl(`direct delivery notification failed for ${key}:`, error.message);
+    }
+  };
+
+  const accepted = await deliverImpl(update, {
+    onAcceptanceFailure,
+    timeoutMs: DIRECT_ACCEPTANCE_TIMEOUT_MS,
+    retryAcceptanceTimeout: false,
+  });
+  // Defensive fallback for injected/custom deliverers and for a pacing deadline
+  // that expires before fetch starts.
+  if (!accepted && !acceptanceFailureReported) await onAcceptanceFailure();
+  return accepted ? "delivered" : "rejected";
+}
+
+export async function routeMessageUpdate(
+  update,
+  {
+    chatKeyImpl = chatKey,
+    loadQueueImpl = loadQueue,
+    runningImpl = isRunning,
+    inFlight = queueInFlight,
+    queueCountImpl = queueCount,
+    replyToBotImpl = isReplyToBot,
+    shouldQueueImpl = shouldQueueBusyUpdate,
+    enqueueImpl = (key, candidate) => enqueueQueueFile(QUEUE_FILE, key, candidate),
+    acknowledgeImpl = acknowledgeQueued,
+    deliverImpl = pacedDeliver,
+    statusImpl = getChatStatus,
+    setStatusIfImpl = setChatStatusIf,
+    sendFailureImpl = sendStaleRunNotice,
+    deleteMessageImpl = deleteStaleWorkingMessage,
+    now = Date.now,
+    trImpl = tr,
+    allowedUserIds = ALLOWED,
+    botUsername = BOT_USERNAME,
+    logImpl = log,
+  } = {},
+) {
+  const key = chatKeyImpl(update);
+  if (update.message && key !== null && !replyToBotImpl(update.message)) {
+    const queue = await loadQueueImpl();
+    const mustQueue =
+      runningImpl(key) || inFlight.has(key) || queueCountImpl(queue, key) > 0;
+    if (mustQueue) {
+      if (!shouldQueueImpl(update, { allowedUserIds, botUsername })) return "dropped";
+      let queued;
+      try {
+        queued = await enqueueImpl(key, update);
+      } catch (error) {
+        logImpl(`queue enqueue failed for update ${update.update_id}:`, error.message);
+        return "enqueue-failed";
+      }
+      await acknowledgeImpl(update, queued.count);
+      return "queued";
+    }
+  }
+
+  return deliverDirectUpdate(update, {
+    key,
+    deliverImpl,
+    statusImpl,
+    setStatusIfImpl,
+    sendFailureImpl,
+    deleteMessageImpl,
+    now,
+    trImpl,
+    logImpl,
+  });
+}
+
+export async function drainReadyQueueHeads({
+  loadImpl = loadQueue,
+  runningImpl = isRunning,
+  statusImpl = getChatStatus,
+  deliverImpl = (update, { timeoutMs }) =>
+    pacedDeliver(update, {
+      route: ACCEPTANCE_ROUTE,
+      acceptedStatus: 204,
+      queueReceipt: true,
+      retry: false,
+      timeoutMs,
+    }),
+  acknowledgeImpl = (key, updateId) => acknowledgeQueueHead(QUEUE_FILE, key, updateId),
+  legacyAllowedUserIds = ALLOWED,
+  now = Date.now,
+  settleUntil = queueSettleUntil,
+  inFlight = queueInFlight,
+  rotationState = queueDrainRotation,
+  passBudgetMs = QUEUE_DRAIN_BUDGET_MS,
+  deliveryTimeoutMs = QUEUE_DELIVERY_TIMEOUT_MS,
+  gateWaitMs = RUN_STALE_MS,
+} = {}) {
+  const snapshot = await loadImpl();
+  const keys = [...new Set([...queueKeys(snapshot), ...inFlight.keys()])];
+  const previousIndex = keys.indexOf(rotationState.afterKey);
+  const orderedKeys =
+    previousIndex < 0
+      ? keys
+      : [...keys.slice(previousIndex + 1), ...keys.slice(0, previousIndex + 1)];
+  const deadline = now() + passBudgetMs;
+  let exhausted = false;
+  let lastAttempted = null;
+
+  for (const key of orderedKeys) {
+    if (now() >= deadline) {
+      exhausted = true;
+      break;
+    }
+    const currentStatus = statusImpl(key);
+    const currentGeneration = statusGeneration(currentStatus);
+    const running = runningImpl(key);
+    const phase = inFlight.get(key);
+    if (phase?.state === "delivering") continue;
+    if (phase?.state === "awaiting-running") {
+      if (running) {
+        inFlight.set(key, { ...phase, state: "running", generation: currentGeneration });
+        continue;
+      }
+      const generationAdvanced = currentGeneration > phase.baselineGeneration;
+      const waitExpired = now() - phase.acceptedAt >= gateWaitMs;
+      if (!generationAdvanced && !waitExpired) continue;
+      inFlight.delete(key);
+    }
+    if (phase?.state === "running") {
+      if (running) continue;
+      inFlight.delete(key);
+    }
+    const item = queueHead(snapshot, key);
+    if (!item) continue;
+    if (running || (settleUntil.get(key) ?? 0) > now()) continue;
+    const update = materializeQueueItem(key, item, { legacyAllowedUserIds });
+    if (!update) {
+      if (!undrainableLegacyLogged.has(key)) {
+        log(`queued legacy messages for ${key} cannot be replayed because their author is not verifiable`);
+        undrainableLegacyLogged.add(key);
+      }
+      continue;
+    }
+    const timeoutMs = Math.max(1, Math.min(deliveryTimeoutMs, deadline - now()));
+    lastAttempted = key;
+    const baselineGeneration = currentGeneration;
+    inFlight.set(key, { state: "delivering", baselineGeneration });
+    let accepted = false;
+    try {
+      accepted = await deliverImpl(update, { timeoutMs });
+    } catch (error) {
+      log(`queued update ${item.updateId} delivery failed:`, error.message);
+    }
+    if (!accepted) {
+      inFlight.delete(key);
+      continue;
+    }
+    if (accepted === "handled") {
+      inFlight.delete(key);
+    } else {
+      const acceptedStatus = statusImpl(key);
+      const acceptedGeneration = statusGeneration(acceptedStatus);
+      if (runningImpl(key)) {
+        inFlight.set(key, {
+          state: "running",
+          baselineGeneration,
+          generation: acceptedGeneration,
+        });
+      } else if (acceptedGeneration > baselineGeneration) {
+        // A complete running -> idle cycle happened while acceptance was pending.
+        inFlight.delete(key);
+      } else {
+        inFlight.set(key, {
+          state: "awaiting-running",
+          baselineGeneration,
+          acceptedAt: now(),
+        });
+      }
+    }
+    // Keep a just-accepted head until its removal is itself durable. If this write
+    // fails, the next pass deliberately replays the same head (at-least-once).
+    try {
+      await acknowledgeImpl(key, item.updateId);
+      settleUntil.set(key, now() + Math.max(SETTLE_MS, 0));
+    } catch (error) {
+      if (error?.code === TELEGRAM_QUEUE_FATAL_DURABILITY) {
+        inFlight.delete(key);
+        rotationState.afterKey = null;
+        throw error;
+      }
+      log(`queued update ${item.updateId} ack failed; head retained or restored:`, error.message);
+    }
+  }
+  rotationState.afterKey = exhausted ? lastAttempted : null;
+  return queueCount(await loadImpl());
 }
 
 // ── self-update (/update) ──────────────────────────────────────────────────
@@ -568,11 +1258,13 @@ export function wizardActionAllowed(st, action) {
   if (action.startsWith("prov:")) return st.step === "provider";
   if (action.startsWith("m:")) return st.step === "models";
   if (action.startsWith("eff:")) return st.step === "effort";
+  if (action === "retry" || action === "back") return st.step === "model_error";
   if (action.startsWith("rs:")) return st.step === "saved";
   return false;
 }
 
 export function selectWizardModel(st, rawIndex) {
+  if (!/^(0|[1-9]\d*)$/.test(String(rawIndex))) return null;
   const index = Number(rawIndex);
   if (!Number.isInteger(index) || index < 0) return null;
   const option = st.modelOptions?.[index];
@@ -592,6 +1284,15 @@ export function selectWizardEffort(st, value) {
   return true;
 }
 
+export function selectableWizardOptions(options, current, limit = 30) {
+  const live = Array.isArray(options) ? options : [];
+  const currentOption = live.find((option) => option.id === current);
+  return [
+    ...(currentOption ? [currentOption] : []),
+    ...live.filter((option) => option !== currentOption),
+  ].slice(0, limit);
+}
+
 async function currentConfig() {
   const env = await readEnvValues(ENV_PATH);
   const provider = CATALOG[env.MODEL_PROVIDER] ? env.MODEL_PROVIDER : "ollama";
@@ -606,6 +1307,10 @@ async function currentConfig() {
 const btn = (text, callback_data) => ({ text, callback_data });
 // cancelRow/menuRow — функции (tr на месте вызова), не module-level const с переведённой строкой.
 const cancelRow = () => [btn(tr("Cancel", "Отмена"), "iva_model:cancel")];
+const retryBackRows = () => [[
+  btn(tr("Retry", "Повторить"), "iva_model:retry"),
+  btn(tr("‹ Back", "‹ Назад"), "iva_model:back"),
+]];
 // Ряд «‹ Меню» на терминальных экранах визарда — возврат в /menu. r:o усыновляет
 // это сообщение даже без живого стейта (движок меню само-чинится после рестарта моста).
 const menuRow = () => [[btn(tr("‹ Menu", "‹ Меню"), "iva_menu:r:o")]];
@@ -647,6 +1352,8 @@ async function handleModelCmd(chatId, from, { msgId } = {}) {
 async function handleThinkCmd(chatId, from, { msgId } = {}) {
   const { provider, model, effort } = await currentConfig();
   const st = newWizard(chatId, from, "think");
+  st.provider = provider;
+  st.model = model;
   st.msgId = msgId ?? null;
   if (!providerSupportsReasoning(provider)) {
     await endWizard(st, tr(
@@ -667,14 +1374,13 @@ async function handleThinkCmd(chatId, from, { msgId } = {}) {
     st,
     () => fetchModelOptions(provider, cat.keyVar ? env[cat.keyVar] : undefined, { dataDir: DATA_DIR_ABS }),
   );
-  if (loaded.stale) return;
-  if (!loaded.ok) return endWizard(st, tr(
-    "Couldn't load thinking levels. Send /think to try again.",
-    "Не удалось загрузить уровни размышлений. Отправь /think, чтобы попробовать снова.",
-  ), menuRow());
-  const options = loaded.value;
-  const option = options.find((candidate) => candidate.id === model)
-    || { id: model, reasoningLevels: providerFallbackReasoningLevels(provider) };
+  const options = await resolveThinkCatalogLoad(st, loaded);
+  if (options === null) return;
+  const option = options.find((candidate) => candidate.id === model);
+  if (!option) return showModelValidationError(
+    st,
+    new ModelValidationError("model_unavailable", `${model} is not in the live catalog`),
+  );
   st.modelOptions = [option];
   st.model = model;
   st.efforts = [...option.reasoningLevels];
@@ -682,6 +1388,19 @@ async function handleThinkCmd(chatId, from, { msgId } = {}) {
   await wizScreen(st,
     tr(`Thinking level for ${model}: ${effortLabel(effort)}.`, `Уровень размышлений для ${model}: ${effortLabel(effort)}.`),
     effortRows("iva_think", true, st.efforts));
+}
+
+export async function resolveThinkCatalogLoad(
+  st,
+  loaded,
+  showErrorImpl = showModelValidationError,
+) {
+  if (loaded.stale) return null;
+  if (!loaded.ok) {
+    await showErrorImpl(st, loaded.error);
+    return null;
+  }
+  return loaded.value;
 }
 
 async function showProviderScreen(st) {
@@ -693,6 +1412,7 @@ async function showProviderScreen(st) {
 
 async function pickProvider(st, provider) {
   st.provider = provider;
+  st.pendingKey = null;
   const cat = CATALOG[provider];
   if (cat.auth === "oauth") {
     st.step = "loading";
@@ -711,7 +1431,8 @@ async function pickProvider(st, provider) {
   }
   const env = await readEnvValues(ENV_PATH);
   if (!wizardIsCurrent(st)) return;
-  if (!env[cat.keyVar]) {
+  if (!env[cat.keyVar] || st.reenterKey === provider) {
+    st.reenterKey = null;
     // В группе ключ вводить нельзя (его не удалить) — отказ до установки awaitText.
     if (!isPrivateChat(st)) return refuseSecretInGroup(st);
     // awaitText обобщает старый awaitKey (см. handleControl): диспатчер по pending.awaitText
@@ -743,39 +1464,43 @@ async function showModelScreen(st) {
   if (!wizardIsCurrent(st)) return;
   const loaded = await runWizardRequest(
     st,
-    () => fetchModelOptions(st.provider, cat.keyVar ? env[cat.keyVar] : undefined, { dataDir: DATA_DIR_ABS }),
+    () => fetchModelOptions(
+      st.provider,
+      cat.keyVar ? (st.pendingKey ?? env[cat.keyVar]) : undefined,
+      { dataDir: DATA_DIR_ABS },
+    ),
   );
   if (loaded.stale) return;
   if (!loaded.ok) {
-    // fetchModelOptions only throws when the live /models probe rejected the stored key (401/403) —
-    // re-enter the key flow instead of offering a list the dead key can't use.
-    // В группе новый ключ вводить нельзя (его не удалить) — отказ до установки awaitText.
-    if (!isPrivateChat(st)) return refuseSecretInGroup(st);
-    st.awaitText = { kind: "apikey", secret: true, data: {} };
-    st.step = "awaiting_key";
-    await wizScreen(st,
-      tr(
-        `The saved ${cat.label} key was rejected. Send a new key in the next message — I'll delete it from the chat right away.`,
-        `Сохранённый ключ ${cat.label} не принят. Пришли новый ключ следующим сообщением — я сразу удалю его из чата.`,
-      ),
-      [cancelRow()]);
-    return;
+    return showModelValidationError(st, loaded.error);
   }
   const options = loaded.value;
-  // Keep the currently configured model selectable even when the live list is long.
   const current = env[cat.modelVar];
-  const currentOption = current
-    ? options.find((option) => option.id === current)
-      || { id: current, reasoningLevels: providerFallbackReasoningLevels(st.provider) }
-    : null;
-  st.modelOptions = [
-    ...(currentOption ? [currentOption] : []),
-    ...options.filter((option) => option.id !== current),
-  ].slice(0, 30);
+  st.modelOptions = selectableWizardOptions(options, current);
   st.step = "models";
   const rows = st.modelOptions.map((option, i) => [btn(option.id, `iva_model:m:${i}`)]);
   rows.push(cancelRow());
-  await wizScreen(st, tr(`Model (${cat.label}):`, `Модель (${cat.label}):`), rows);
+  const currentLine = current
+    ? tr(`Current (display only): ${current}.`, `Текущая (только для справки): ${current}.`)
+    : "";
+  await wizScreen(st, [
+    currentLine,
+    tr(`Choose a live model (${cat.label}):`, `Выбери модель из живого каталога (${cat.label}):`),
+  ].filter(Boolean).join("\n"), rows);
+}
+
+async function showModelValidationError(st, error) {
+  st.step = "model_error";
+  if (error?.code === "auth_rejected" && CATALOG[st.provider]?.keyVar) {
+    st.reenterKey = st.provider;
+  }
+  const reason = error instanceof ModelValidationError
+    ? error.message
+    : tr("provider validation failed", "проверка провайдера не прошла");
+  await wizScreen(st, tr(
+    `Couldn't validate the live model catalog: ${reason}. Your current configuration was not changed.`,
+    `Не удалось проверить живой каталог моделей: ${reason}. Текущая конфигурация не изменена.`,
+  ), retryBackRows());
 }
 
 // Codex device-link login. runDeviceCodeLogin polls up to 15 min — deliberately NOT
@@ -845,20 +1570,39 @@ async function handleKeyMessage(msg, st) {
     return true;
   }
   st.awaitText = null;
-  await upsertEnv(ENV_PATH, { [cat.keyVar]: key }); // persist immediately — the chat copy is gone
+  st.pendingKey = key;
   if (!wizardIsCurrent(st)) return true;
   await showModelScreen(st);
   return true;
 }
 
-async function saveWizard(st) {
+export async function validateAndSaveWizard(st, {
+  readEnv = () => readEnvValues(ENV_PATH),
+  validate = validateModelSelection,
+  write = (updates) => upsertEnv(ENV_PATH, updates),
+} = {}) {
+  const env = await readEnv();
+  const cat = CATALOG[st.provider];
+  if (!cat || typeof st.model !== "string") {
+    throw new ModelValidationError("invalid_selection", "invalid wizard selection");
+  }
+  const key = cat.keyVar ? (st.pendingKey ?? env[cat.keyVar]) : undefined;
+  await validate({
+    provider: st.provider,
+    model: st.model,
+    key,
+    dataDir: DATA_DIR_ABS,
+  });
   const updates = { THINKING_EFFORT: st.effort }; // null ⇒ drop the line ("не задан")
   if (st.flow === "model") {
     updates.MODEL_PROVIDER = st.provider;
-    updates[CATALOG[st.provider].modelVar] = st.model;
+    updates[cat.modelVar] = st.model;
+    if (cat.keyVar && st.pendingKey) updates[cat.keyVar] = st.pendingKey;
   }
-  await upsertEnv(ENV_PATH, updates);
+  await write(updates);
 }
+
+const saveWizard = (st) => validateAndSaveWizard(st);
 
 async function showSaved(st) {
   const { provider, model, effort } = await currentConfig();
@@ -902,6 +1646,22 @@ async function handleWizardCallback(cq) {
     if (CATALOG[p]) await pickProvider(st, p);
     return true;
   }
+  if (action === "retry") {
+    if (st.flow === "think") {
+      await handleThinkCmd(st.chatId, st.userId, { msgId: st.msgId });
+      return true;
+    }
+    await showModelScreen(st);
+    return true;
+  }
+  if (action === "back") {
+    if (st.flow === "think") {
+      await endWizard(st, tr("Kept the current configuration.", "Оставил текущую конфигурацию."), menuRow());
+      return true;
+    }
+    await showProviderScreen(st);
+    return true;
+  }
   if (action.startsWith("m:")) {
     const option = selectWizardModel(st, action.slice("m:".length));
     if (!option) return true;
@@ -911,6 +1671,10 @@ async function handleWizardCallback(cq) {
         await saveWizard(st);
       } catch (e) {
         if (!wizardIsCurrent(st)) return true;
+        if (e instanceof ModelValidationError) {
+          await showModelValidationError(st, e);
+          return true;
+        }
         await endWizard(st, tr("Couldn't save .env: " + e.message, "Не удалось сохранить .env: " + e.message), menuRow());
         return true;
       }
@@ -931,6 +1695,10 @@ async function handleWizardCallback(cq) {
       await saveWizard(st);
     } catch (e) {
       if (!wizardIsCurrent(st)) return true;
+      if (e instanceof ModelValidationError) {
+        await showModelValidationError(st, e);
+        return true;
+      }
       await endWizard(st, tr("Couldn't save .env: " + e.message, "Не удалось сохранить .env: " + e.message), menuRow());
       return true;
     }
@@ -984,7 +1752,9 @@ const menu = createMenu({
     root: ROOT,
     sc,
     reply,
-    deliver: pacedDeliver, // синтетический deliver дистилляции обязан пейситься, как главный цикл
+    // Синтетическая дистилляция делит acceptance, пейсинг и уборку failed-ingress
+    // с обычной прямой доставкой, но намеренно не проходит busy-time FIFO.
+    deliver: (update) => deliverDirectUpdate(update).then((result) => result === "delivered"),
     log,
     allowed: ALLOWED,
     handleModelCmd,
@@ -1207,46 +1977,35 @@ async function handleControl(update) {
     return true;
   }
 
+  const clearsPrivateQueue = msg?.chat?.type === "private";
   try {
-    await requestTelegramReset({
-      url: RESET_ROUTE,
-      secret: SECRET,
-      continuationToken,
-    });
-  } catch (e) {
-    log(`scoped reset failed for ${key}:`, e.message);
-    if (status) {
-      await edit(
-        chatId,
-        status.message_id,
-        tr(
-          "⚠️ Couldn't reset this conversation. Nothing else was cleared.",
-          "⚠️ Не удалось сбросить этот диалог. Остальные данные не затронуты.",
-        ),
-      );
-    }
-    return true;
-  }
-
-  try {
-    await completeScopedResetState(key, continuationToken, {
+    await performScopedReset(key, continuationToken, {
       // Group/forum queues are keyed only by chat/topic while Eve sessions also
       // include conversationId. Clearing the shared queue here would lose
       // messages belonging to other group conversation anchors.
-      clearQueue: msg?.chat?.type === "private",
+      clearQueue: clearsPrivateQueue,
     });
   } catch (e) {
-    log(`scoped reset cleanup failed for ${key}:`, e.message);
+    log(`scoped reset ${e.resetPhase ?? "unknown"} failed for ${key}:`, e.message);
     if (status) {
       await edit(
         chatId,
         status.message_id,
-        tr(
-          "⚠️ Conversation reset, but local cleanup failed. Send /new again before sending anything else.",
-          "⚠️ Диалог сброшен, но локальная очистка не завершилась. Отправьте /new ещё раз до новых сообщений.",
-        ),
+        e.resetPhase === "remote"
+          ? tr(
+              "⚠️ Couldn't confirm this conversation reset. Recovery will retry automatically.",
+              "⚠️ Не удалось подтвердить сброс диалога. Восстановление повторит его автоматически.",
+            )
+          : tr(
+              "⚠️ Conversation reset recovery is incomplete. Iva will retry it before accepting queued work.",
+              "⚠️ Восстановление после сброса не завершено. Iva повторит его до приёма задач из очереди.",
+            ),
       );
     }
+    // A private reset request is ambiguous after any I/O failure: Eve may have
+    // committed it even when the response was lost. Stop this polling process so
+    // startup reconciliation consumes the durable intent before any old head.
+    if (clearsPrivateQueue) throw e;
     return true;
   }
 
@@ -1270,8 +2029,19 @@ async function handleControl(update) {
 async function main() {
   if (!TOKEN) throw new Error("no TELEGRAM_BOT_TOKEN in .env — nothing to poll");
   if (!SECRET) throw new Error("no TELEGRAM_WEBHOOK_SECRET_TOKEN — the channel won't accept updates");
-  log(`telegram-poll start → ${ROUTE}`);
+  log(`telegram-poll start → messages ${ACCEPTANCE_ROUTE}; callbacks ${ROUTE}`);
   await removeStaleUpdateJobs();
+  // Upgrade the old {chatKey: string[]} queue atomically before polling. A failed
+  // migration stops the bridge, so Telegram retains new updates until the old bytes
+  // are safely represented as versioned FIFO items.
+  await migrateQueueFile(QUEUE_FILE, {
+    onLegacyQuarantine: (path) =>
+      log(`legacy Telegram group messages moved to ${path}; sender identity was unavailable`),
+  });
+  const reconciledResets = await reconcileScopedResetIntents();
+  if (reconciledResets > 0) {
+    log(`reconciled ${reconciledResets} durable private Telegram reset intent(s)`);
+  }
   // First run (no offset file) — drop the accumulated install backlog (drop_pending=true),
   // so old messages don't replay in a batch → parallel sessions on one chat (HookConflict).
   // On subsequent starts we do NOT drop the backlog (don't lose messages that arrived while the bridge was down).
@@ -1290,13 +2060,41 @@ async function main() {
   }
 
   for (;;) {
+    // One head per idle chat/topic per pass. While any queue remains, use a short
+    // Telegram long-poll so terminal/stale run-status changes trigger drain quickly.
+    try {
+      await reapStaleRuns();
+    } catch (e) {
+      log("stale run reaper failed:", e.message);
+    }
+    let pendingQueueCount = await drainReadyQueueHeads();
+    let collectorWriteFailed = false;
+    for (const update of collectorTakeExpired(messageCollector, Date.now())) {
+      const routed = await routeMessageUpdate(update);
+      if (routed === "delivered") {
+        delivered =
+          delivered === null ? update.update_id : Math.max(delivered, update.update_id);
+        await saveOffset(offset, delivered);
+      } else if (routed === "queued") {
+        pendingQueueCount = Math.max(1, pendingQueueCount);
+      } else if (routed === "enqueue-failed") {
+        collectorRestore(messageCollector, update);
+        collectorWriteFailed = true;
+      }
+    }
+    if (collectorWriteFailed) {
+      await sleep(3000);
+      continue;
+    }
+    const pollSeconds =
+      pendingQueueCount > 0 || collectorPending(messageCollector) > 0 ? 1 : 30;
     let data;
     try {
       data = await tg("getUpdates", {
         offset,
-        timeout: 30,
+        timeout: pollSeconds,
         allowed_updates: ["message", "callback_query"],
-      }, { timeoutMs: 40_000 }); // above the 30s long-poll window
+      }, { timeoutMs: pollSeconds > 1 ? 40_000 : 10_000 });
     } catch (e) {
       log("getUpdates network:", e.message);
       await sleep(3000);
@@ -1311,6 +2109,7 @@ async function main() {
       await sleep(3000);
       continue;
     }
+    let queueWriteFailed = false;
     for (const update of data.result || []) {
       // Переигровка после краша (Telegram = at-least-once): этот апдейт уже уходил в eve
       // в прошлой жизни процесса — второй раз не доставляем, только двигаем offset.
@@ -1326,63 +2125,41 @@ async function main() {
         await saveOffset(offset, delivered);
         continue;
       }
-      const key = chatKey(update);
-      let drainedKey = null; // чей буфер приклеен к этому апдейту — чистится после доставки
-      // ESC-stop queue gate (messages only): while a turn is running for this chat, buffer
-      // the message instead of delivering. callback_query always passes (eve HITL buttons
-      // and ⏹ Стоп must reach a busy agent). Replies to bot messages also pass — that's
-      // how HITL ForceReply answers arrive; queueing one would deadlock the waiting turn.
-      if (update.message && key !== null && update.message.reply_to_message?.from?.is_bot !== true) {
-        if (isRunning(key)) {
-          const entry = bufferEntryOf(update.message);
-          if (entry !== null) {
-            const q = await loadQueue();
-            (q[key] ??= []).push(entry);
-            await saveQueue(q);
-            // Silent ack: a 👀 reaction on the user's message (no extra chat message).
-            await tg("setMessageReaction", {
-              chat_id: update.message.chat.id,
-              message_id: update.message.message_id,
-              reaction: [{ type: "emoji", emoji: "👀" }],
-            }).catch((e) => log("reaction failed:", e.message));
-          }
+      let candidate = update;
+      let collected = false;
+      if (update.message && !isReplyToBot(update.message)) {
+        const offered = collectorOffer(messageCollector, update, Date.now());
+        if (offered.status === "buffered") {
+          // The quiet-window buffer is intentionally in-memory. Advancing now avoids
+          // replaying every part, but a process crash can lose this one pending burst.
           offset = update.update_id + 1;
           await saveOffset(offset, delivered);
           continue;
         }
-        // Idle again: the next fresh message carries the queued ones along. The queue is
-        // cleared AFTER successful delivery (below) — clearing it here would lose the
-        // buffered messages if the process dies before deliver() succeeds.
-        const q = await loadQueue();
-        const pending = q[key];
-        if (Array.isArray(pending) && pending.length) {
-          update.message.iva_buffered = pending;
-          drainedKey = key;
+        if (offered.status === "ready") {
+          candidate = offered.update;
+          collected = true;
+          offset = update.update_id + 1;
+          await saveOffset(offset, delivered);
         }
       }
-      // Don't deliver the next update of the same chat until eve has parked the previous turn
-      // (pause measured from the last delivery to this chat) — otherwise a burst → HookConflict.
-      // pacedDeliver держит lastDeliverAt на модуль-уровне, общую с deps.deliver меню.
-      const accepted = await pacedDeliver(update);
-      offset = update.update_id + 1;
-      if (accepted) {
-        // Порядок персиста: СНАЧАЛА маркер delivered, ПОТОМ очистка буфера. Краш между
-        // ними оставляет буфер на месте при уже записанном маркере → на переигровке
-        // апдейт пропустится, буфер приклеится к следующему сообщению — дубль возможен,
-        // потеря нет. Обратный порядок (буфер раньше маркера) терял бы очередь.
-        delivered = update.update_id;
-        await saveOffset(offset, delivered);
-        if (drainedKey !== null) {
-          const q = await loadQueue();
-          delete q[drainedKey];
-          await saveQueue(q);
-        }
-      } else {
-        // Апдейт выброшен как битый: буфер НЕ трогаем (приклеится к следующему сообщению),
-        // маркер не ставим — offset двигаем, чтобы не молоть тот же апдейт.
-        await saveOffset(offset, delivered);
+
+      const routed = await routeMessageUpdate(candidate);
+      if (routed === "enqueue-failed") {
+        if (collected) collectorRestore(messageCollector, candidate);
+        // Passthrough retains the old durable retry point. Collected parts already
+        // advanced offset when buffered and retry from the restored in-memory burst.
+        queueWriteFailed = true;
+        break;
       }
+      if (!collected) offset = update.update_id + 1;
+      if (routed === "delivered") {
+        delivered =
+          delivered === null ? candidate.update_id : Math.max(delivered, candidate.update_id);
+      }
+      await saveOffset(offset, delivered);
     }
+    if (queueWriteFailed) await sleep(3000);
   }
 }
 

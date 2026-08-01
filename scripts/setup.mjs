@@ -8,14 +8,29 @@ import { createReadStream, existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
-import { defaultChecker, PortSelector } from "./lib/ports.mjs";
+import { dirname, join, resolve } from "node:path";
+import {
+  confirmOccupiedCurrentPort,
+  defaultChecker,
+  PortSelector,
+} from "./lib/ports.mjs";
 import { generateAssistantBearer, isAssistantBearer } from "./lib/assistant-auth.mjs";
 import { writeEnvAtomicSync } from "./lib/env-file.mjs";
 import { authFilePath, readAuth, runDeviceCodeLogin, runBrowserLogin, listCodexModels } from "./lib/codex-oauth.mjs";
+import {
+  probeOpenRouterModel,
+  validateModelSelection,
+} from "./lib/model-validation.mjs";
+import { keptSetupWritePlan } from "./lib/setup-keep.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const ENV_PATH = join(ROOT, ".env");
+const SOURCE_ENV_PATH = join(ROOT, ".env");
+// `iva config` stages a complete candidate outside the live .env, then applies it
+// transactionally. Direct setup/install keeps the historical live path.
+const ENV_PATH = process.env.IVA_CONFIG_OUTPUT
+  ? resolve(process.env.IVA_CONFIG_OUTPUT)
+  : SOURCE_ENV_PATH;
+const STAGING_CONFIG = ENV_PATH !== SOURCE_ENV_PATH;
 // Абсолютный каталог data (тот же, что видит агент из cwd=ROOT). Хранит codex-auth.json (OAuth).
 const dataDirAbs = (env) => {
   const d = (env && env.ASSISTANT_DATA_DIR) || "data";
@@ -34,7 +49,9 @@ const OPENCODE_MODELS = [
   "kimi-k3",
   "kimi-k2.7-code",
   "glm-5.2",
+  "minimax-m3",
   "qwen3.7-max",
+  "grok-4.5",
 ];
 
 const C = { g: "\x1b[32m", y: "\x1b[33m", c: "\x1b[36m", b: "\x1b[1m", r: "\x1b[31m", x: "\x1b[0m" };
@@ -72,14 +89,26 @@ async function pickPort(def) {
     }
     const { occupied, holders } = await checker.check(port);
     if (!occupied) return String(port);
-    // Reconfiguring a live Iva: the current (unchanged) port reads as "busy" —
-    // it's held by Iva's OWN server. Don't offer to move: that would steer IVA_PORT away from
-    // clients (bridge/cron on ASSISTANT_HOST) → the bot would go mute. Keep the port as is.
-    // ponytail: assume the holder of an unchanged port is our own server (the typical case).
-    if (port === Number(def)) {
-      console.log(`  ${C.y}${t(`Port ${port} is busy — looks like Iva itself (the running server). Keeping it.`, `Порт ${port} занят — похоже, это сам Iva (текущий сервер). Оставляю.`)}${C.x}`);
-      return String(port);
-    }
+    const reuse = await confirmOccupiedCurrentPort({
+      port,
+      currentPort: def,
+      holders,
+      confirm: async ({ port: current, holders: found }) => {
+        const who = found.length ? ` (${found.join("; ")})` : "";
+        console.log(`  ${C.y}${t(
+          `Port ${current} is already occupied${who}. Ownership cannot be verified.`,
+          `Порт ${current} уже занят${who}. Проверить владельца надёжно нельзя.`,
+        )}${C.x}`);
+        return askYesNo(
+          `  ${t(
+            `Keep occupied port ${current}? Only confirm if it is the running Iva`,
+            `Оставить занятый порт ${current}? Подтверди, только если это запущенная Iva`,
+          )}`,
+          false,
+        );
+      },
+    });
+    if (reuse) return String(port);
     const free = await new PortSelector(checker).firstFree(port + 1);
     const who = holders.length ? ` (${holders.join("; ")})` : "";
     console.log(`  ${C.y}${t(`Port ${port} is busy${who}.`, `Порт ${port} занят${who}.`)}${C.x}${free ? ` ${t("Nearest free", "Ближайший свободный")}: ${C.g}${free}${C.x}.` : ""}`);
@@ -125,7 +154,7 @@ function parseEnv(text) {
 }
 async function loadExistingEnv() {
   try {
-    return parseEnv(await readFile(ENV_PATH, "utf8"));
+    return parseEnv(await readFile(SOURCE_ENV_PATH, "utf8"));
   } catch (error) {
     if (error?.code === "ENOENT") return {};
     throw error;
@@ -242,22 +271,18 @@ export function openrouterErrReason(j, status) {
 }
 async function openrouterModelCheck(key, model) {
   try {
-    const res = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: "user", content: "Call the ping tool." }],
-        tools: [{ type: "function", function: { name: "ping", description: "health check", parameters: { type: "object", properties: {} } } }],
-        tool_choice: "auto",
-        max_tokens: 32,
-      }),
+    const result = await probeOpenRouterModel({ model, key }, {
+      errorReason: openrouterErrReason,
     });
-    const j = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const reason = openrouterErrReason(j, res.status);
-      // Совет про function calling — только когда причина реально про инструменты; иначе он вводит
-      // в заблуждение (напр. региональная 403 от провайдера к tool calling отношения не имеет).
+    if (!result.answered) {
+      console.log(
+        `${C.y}${t("(model replied empty — maybe a reasoning model / max_tokens; proceeding)", "(модель ответила пусто — возможно reasoning-модель / max_tokens; продолжаю)")}${C.x}`,
+      );
+    }
+    return null;
+  } catch (e) {
+    if (e?.code === "model_unavailable" || e?.code === "auth_rejected") {
+      const reason = e.message;
       const toolIssue = /tool use|function call|no endpoints found that support tool/i.test(reason);
       const hint = toolIssue
         ? t(
@@ -270,16 +295,6 @@ async function openrouterModelCheck(key, model) {
           );
       return t(`the model can't be used: ${reason}. ${hint}`, `модель не подходит: ${reason}. ${hint}`);
     }
-    // 200 = ключ+слаг+tools ок. «Ответила» = есть content ИЛИ tool_calls (модель могла сразу дёрнуть tool).
-    const msg = j?.choices?.[0]?.message;
-    const answered = (msg?.content && msg.content.trim()) || (Array.isArray(msg?.tool_calls) && msg.tool_calls.length);
-    if (!answered) {
-      console.log(
-        `${C.y}${t("(model replied empty — maybe a reasoning model / max_tokens; proceeding)", "(модель ответила пусто — возможно reasoning-модель / max_tokens; продолжаю)")}${C.x}`,
-      );
-    }
-    return null; // слаг валиден и tool-совместим
-  } catch (e) {
     return t(`request failed: ${e.message}`, `запрос не прошёл: ${e.message}`);
   }
 }
@@ -375,7 +390,15 @@ async function main() {
     console.log(`  • ${t("Access", "Доступ")}:    ${existing.TELEGRAM_ALLOWED_USER_IDS}`);
     console.log(`  • Deepgram:  ${existing.DEEPGRAM_LANGUAGE || "multi"}   ·   TZ: ${existing.ASSISTANT_TIMEZONE || "?"}`);
     if (!(await askYesNo(`\n  ${t("Reconfigure from scratch?", "Перенастроить заново?")}`, false))) {
-      await writeEnv(out); // persist the language choice even when keeping everything else
+      if (keptSetupWritePlan(existing, out) === "validate-and-write") {
+        await validateModelSelection({
+            provider: prov0,
+            model: existing[provModel],
+            key: provKey ? existing[provKey] : undefined,
+            dataDir: dataDirAbs(existing),
+          });
+        await writeEnv(out);
+      }
       console.log(`${C.g}  ${t("Keeping current settings — nothing to enter.", "Оставляю текущие настройки как есть — ничего вводить не нужно.")}${C.x}`);
       rl.close();
       return;
@@ -655,13 +678,29 @@ async function main() {
   const localHost = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\/?$/i.test(out.ASSISTANT_HOST || "");
   out.ASSISTANT_HOST = !out.ASSISTANT_HOST || localHost ? `http://127.0.0.1:${out.IVA_PORT}` : out.ASSISTANT_HOST;
   // ── Write .env ────────────────────────────────────────────────────
+  const selected = {
+    ollama: { model: "OLLAMA_MODEL", key: "OLLAMA_API_KEY" },
+    opencode: { model: "OPENCODE_MODEL", key: "OPENCODE_API_KEY" },
+    openrouter: { model: "OPENROUTER_MODEL", key: "OPENROUTER_API_KEY" },
+    codex: { model: "CODEX_MODEL", key: null },
+  }[out.MODEL_PROVIDER];
+  process.stdout.write(`  ${t("validating the selected model again…", "ещё раз проверяю выбранную модель…")} `);
+  await validateModelSelection({
+    provider: out.MODEL_PROVIDER,
+    model: out[selected.model],
+    key: selected.key ? out[selected.key] : undefined,
+    dataDir: dataDirAbs(out),
+  });
+  console.log(`${C.g}${t("ok", "ок")}${C.x}`);
   await writeEnv(out);
 
   const chosenModel =
     { opencode: out.OPENCODE_MODEL, openrouter: out.OPENROUTER_MODEL, codex: out.CODEX_MODEL }[provider] || out.OLLAMA_MODEL;
   console.log();
   hr();
-  console.log(`${C.g}${C.b}  ✓ ${t("Done — everything written to .env", "Готово — всё записано в .env")}${C.x}`);
+  console.log(`${C.g}${C.b}  ✓ ${STAGING_CONFIG
+    ? t("Ready — settings validated for apply", "Готово к применению — настройки проверены")
+    : t("Done — everything written to .env", "Готово — всё записано в .env")}${C.x}`);
   console.log(`  ${t("Provider", "Провайдер")}: ${provider} · ${t("Model", "Модель")}: ${C.g}${chosenModel}${C.x} · Deepgram: ${out.DEEPGRAM_LANGUAGE} · ${t("Bot", "Бот")}: ${C.g}@${out.TELEGRAM_BOT_USERNAME}${C.x}`);
   console.log(`  ${t("Access", "Доступ")}: ${out.TELEGRAM_ALLOWED_USER_IDS} · TZ: ${out.ASSISTANT_TIMEZONE} · vault: ${out.ASSISTANT_VAULT_DIR} · ${t("lang", "язык")}: ${out.AGENT_LANGUAGE}`);
   hr();

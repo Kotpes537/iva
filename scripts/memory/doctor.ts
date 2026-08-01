@@ -8,9 +8,18 @@
 // Guards: no git-remote/credentials → alert admin on Telegram (gh auth login + git remote),
 // push is skipped. Health score drop → alert on Telegram. Plain Node orchestration.
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { CORE_CAP } from "../lib/core-cap.mjs";
+import {
+  classifyGitPushError,
+  formatMegabytes,
+  recordSkippedOversize,
+  scanOversizeWorkingTreeFiles,
+} from "../lib/memory-maintenance.mjs";
+import { notificationChat } from "../lib/notification-chat.mjs";
+import { clampCore } from "./core-clamp.mjs";
 
 const VAULT = resolve(process.env.ASSISTANT_VAULT_DIR ?? "vault");
 // The autograph code lives in THIS repo, not in the vault: the vault is user data only.
@@ -18,7 +27,7 @@ const VAULT = resolve(process.env.ASSISTANT_VAULT_DIR ?? "vault");
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const SCRIPTS = resolve(ROOT, "scripts/autograph");
 const BOT = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT = process.env.TELEGRAM_DIGEST_CHAT_ID; // admin chat
+const CHAT = notificationChat(); // admin chat
 const TZ = process.env.ASSISTANT_TIMEZONE ?? process.env.TZ ?? "UTC";
 
 if (!existsSync(VAULT)) {
@@ -134,15 +143,32 @@ if (failures.length) {
 }
 
 // ── 1b. CORE guard: the memory core must stay small (always-on floor stays flat) ──
-// 20-core.ts truncates on the fly, but a bloated CORE.md signals the nightly rollup did not shrink the core.
-const CORE_CAP = 1200;
+// This runs before git add/commit below, so a repaired CORE is included in the nightly backup.
 const corePath = resolve(VAULT, "CORE.md");
 if (existsSync(corePath)) {
-  const coreLen = readFileSync(corePath, "utf8").length;
-  if (coreLen > CORE_CAP) {
+  const oldCore = readFileSync(corePath, "utf8");
+  if (oldCore.length > CORE_CAP) {
+    const newCore = clampCore(oldCore);
+    const tmp = `${corePath}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      writeFileSync(tmp, newCore, "utf8");
+      renameSync(tmp, corePath);
+    } catch (error) {
+      try {
+        rmSync(tmp, { force: true });
+      } catch {
+        /* preserve the original write/rename failure */
+      }
+      throw error;
+    }
+    console.warn(`doctor: CORE.md clamped ${oldCore.length} → ${newCore.length} chars (cap ${CORE_CAP})`);
+    const protectedOverflow =
+      newCore.length > CORE_CAP
+        ? " Protected headings, pointers or unknown sections still exceed the cap."
+        : "";
     await telegram(
-      `CORE.md is bloated: ${coreLen}/${CORE_CAP} chars (${today}). ` +
-        `The nightly rollup should shrink the core per scripts/memory/instructions/rules/core-format.md.`,
+      `CORE.md exceeded its ${CORE_CAP}-char cap (${today}); doctor clamped it ` +
+        `${oldCore.length} → ${newCore.length} chars. Pointers were preserved.${protectedOverflow}`,
     );
   }
 }
@@ -158,6 +184,37 @@ if (history.length >= 2) {
 }
 
 // ── 3. Git commit & push ──
+// Check the complete working-tree snapshot before staging anything. If even one file is
+// unsafe, skip the whole commit: a partial commit would make the nightly backup look complete
+// while silently omitting vault data.
+let oversized: Array<{ path: string; size: number }>;
+try {
+  oversized = scanOversizeWorkingTreeFiles({
+    vaultPath: VAULT,
+    runGit: (args: string[]) => run("git", args),
+  });
+} catch (error) {
+  const detail = error instanceof Error ? error.message : String(error);
+  const message =
+    `vault: не удалось проверить размеры файлов перед git add (${detail}); ` +
+    "ночной коммит отложен, чтобы не повредить историю.";
+  console.warn(`doctor: ${message}`);
+  await telegram(message);
+  process.exit(1);
+}
+
+if (oversized.length) {
+  recordSkippedOversize(resolve(VAULT, ".graph/enforce-report.json"), oversized.length);
+  const lines = oversized.map(
+    ({ path, size }) =>
+      `файл ${path} (${formatMegabytes(size)}) превышает лимит GitHub; ` +
+      "ночной cleanup должен его ужать, коммит отложен",
+  );
+  for (const line of lines) console.warn(`doctor: ${line}`);
+  await telegram(`vault:\n${lines.join("\n")}`);
+  process.exit(1);
+}
+
 // Auto-provision a private backup remote via the already-authorized gh CLI instead of
 // nagging nightly: only alert when gh itself can't help (not installed / not logged in).
 function ensureRemote(): string {
@@ -198,11 +255,18 @@ run("git", ["add", "-A"]);
 run("git", ["commit", "-m", `chore: memory ${today}`]);
 const push = run("git", ["push"]);
 if (push.status !== 0) {
-  await telegram(
-    "vault: git push failed (no credentials?). On the server run `gh auth login` " +
-      `and verify remote access (cd ${VAULT} && git push).`,
-  );
-  console.error("doctor: git push failed");
+  const error = classifyGitPushError(push.stderr);
+  const message =
+    error.kind === "oversize"
+      ? "vault: git push отклонён: история уже содержит слишком большой blob. " +
+        "Нужна ручная очистка: `git checkout --orphan vault-clean` — сверни историю vault " +
+        "в один чистый коммит и запушь с `--force`."
+      : error.kind === "auth"
+        ? "vault: git push failed (no credentials?). On the server run `gh auth login` " +
+          `and verify remote access (cd ${VAULT} && git push).`
+        : `vault: git push failed: ${error.firstLine}`;
+  console.warn(`doctor: ${message}`);
+  await telegram(message);
   process.exit(1);
 }
 

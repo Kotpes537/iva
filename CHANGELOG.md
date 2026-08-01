@@ -2,6 +2,57 @@
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-07-31
+
+- ✅ **Google Задачи через `gws`** (#108) — агент умеет смотреть/добавлять/закрывать/удалять задачи (generic `gws tasks …`, без отдельного кода интеграции); tasks-скоуп запрашивается при подключении Google, давно подключённым — кнопка «Переподключить» в /menu → Google.
+
+[0.3.8]: https://github.com/smixs/iva/releases/tag/v0.3.8
+
+## [0.3.7] - 2026-07-31
+
+Надёжность обновлений и установки — обе идеи предложил и обкатал в своём форке [@mamysh](https://github.com/mamysh) (#102, reference-реализации mamysh/iva#7 и mamysh/iva#15):
+
+- 🧪 **Replica gate в CI** (#103) — каждый PR проходит одноразовую изолированную установку с mock-провайдером: прод-билд, старт, первый реальный ответ, рестарт. Заодно поймана регрессия резюма сессий через рестарт на eve 0.27.13 (#104).
+- 🛡️ **`iva update` собирает кандидата в отдельном worktree** (#105) — сломанное обновление больше не трогает живую установку: билд проверяется в `.iva-update/staging`, и только после успеха артефакты переносятся atomically-rename'ом. Активируется со следующего релиза.
+- 🩹 **Ночная память переживает рестарт сервера** (#104) — таймаут хода и свежая сессия вместо молчаливого зависания.
+- 🛡️ **TimeoutStartSec на memory-юнитах** — зависшая ночь убивается по таймауту и видна в `iva doctor`.
+
+[0.3.7]: https://github.com/smixs/iva/releases/tag/v0.3.7
+
+## [0.3.6] - 2026-07-30
+
+Fix: оборвавшиеся ходы видимы и не глушат бота, ошибки провайдера читаемы, память и её бэкап держат себя в форме.
+
+- 🩹 **Мост видит ошибки доставки мгновенно** — все доставки сообщений идут через acceptance-роут: зависший чат сбрасывается сразу, а не через 30 минут реапером.
+- 🧹 **eve обновлён до 0.27.13** — ретраи на обрыв стрима провайдера, ограничение локального trace-хранилища; патч детерминированных ошибок перенесён.
+- 🩹 **Telegram сам освобождает чат после оборвавшегося хода** (#85, #87, #91) - раньше бот молчал до 30 минут; теперь мост сбрасывает зависший статус, освобождает сессию и сообщает об ошибке.
+- 🧠 **CORE.md больше не распухает** (#86) — ночной doctor детерминированно ужимает файл до капа, вытесняя старейшие пункты предпочтений и не трогая указатели; rollup проверяет свою работу.
+- 🩹 **Ошибки провайдера теперь доходят до чата человеческим языком** (#85) — лимит, баланс, ключ и сбой провайдера больше не превращаются в молчание или «контекст переполнился».
+- 🧠 **Алерты памяти теперь доходят без `TELEGRAM_DIGEST_CHAT_ID`** — фолбэк на первого доверенного пользователя (часть #88).
+- 🩹 **Закрыты остатки #88 в Python-обработке карточек** — Python-писатель frontmatter приведён к TS-диалекту: однопробельный отступ и пустая строка внутри folded-описания больше не теряют и не реанимируют текст; `enforce.py` пропускает гигантские файлы вместо OOM.
+- 🛡️ **Ночной бэкап vault больше не травит git-историю гигантскими файлами** — oversize-файлы останавливают коммит до `git add`, отказ push честно различает лимит GitHub, авторизацию и прочие ошибки; `iva doctor` показывает упавшие memory-юниты и проблемы ночного отчёта.
+- 🧹 **Первое сообщение после ответа больше не попадает в ложную очередь** (#78) — Telegram-мост очищает in-flight запись чата, когда последний элемент durable-очереди обработан и ход завершён, поэтому следующий текст сразу доставляется вместо «В очереди: 1».
+- 📸 **Альбомы и разрезанные сообщения — один ход** (#80) — Telegram-мост собирает последовательные части от одного отправителя в одном чате/топике после тихого окна (800 мс, 1500 мс для альбомов), а очередь хранит весь burst одним элементом. `TELEGRAM_COLLECT_QUIET_MS=0` возвращает прежний passthrough; offset сохраняется при буферизации, поэтому аварийная остановка в тихом окне может потерять один текущий in-memory burst.
+
+[0.3.6]: https://github.com/smixs/iva/releases/tag/v0.3.6
+
+## [0.3.5] - 2026-07-28
+
+Fix: busy Telegram messages survive restarts, configuration changes roll back safely, and slow or truncated input is visible.
+
+- 📬 **Durable follow-up queue** (#51) - per-chat FIFO, atomic writes, automatic drain and restart recovery.
+- 💬 **Earlier Telegram feedback** (#53, #57, #59) - immediate working status, structured reply context and explicit truncation markers.
+- ⚙️ **Safe configuration changes** (#54, #55, #56) - live model validation, atomic `.env`, health check and rollback.
+- 🩺 **Real userbot health** (#58) - one bounded probe for CLI and Telegram, with redacted diagnostics.
+- 🧹 **Complete subprocess cleanup** (#52) - timeouts reap the shell and its descendants.
+- ⛔ **The agent can no longer restart itself out from under you** (#68) — asked in chat, the model would happily run `iva restart` from its own shell tool, killing its own turn mid-flight. That turn then stays `running` forever, eve re-enqueues it on every startup ("Re-enqueued N active run(s)"), replays it up to the same restart command and dies again — an endless restart loop, with the Telegram continuation-hook never released (`HookConflictError`, mute bot) as a bonus. The prompt already forbade this; models ignore prompts, so the bash tool now hard-blocks self-lethal commands (`iva restart|stop|reset|update`, `systemctl … restart|stop|kill iva.service`, `pkill`/`killall` aimed at `node`/`eve`) before execution and tells the model to offer `/restart` or `/update` in chat instead. Diagnostics (`status`, `journalctl`), memory timers and the polling bridge stay unrestricted. Note: a time-based "don't replay stale running runs" guard was deliberately NOT added — parked sessions legitimately stay `running` for weeks, and such a TTL would sever them.
+- 🔒 **Two high-severity DoS advisories closed in dependencies** — `brace-expansion` 5.0.6 → 5.0.8 (CVE-2026-14257: exponential-time expansion of `{}` groups; reported in #69, thanks [@anupamme](https://github.com/anupamme)) and `fast-xml-parser` 5.9.3 → 5.10.1 (GHSA-8r6m-32jq-jx6q: repeated DOCTYPE declarations reset entity-expansion limits). Both reach Iva transitively through `just-bash`; the fix is lockfile-only, `npm audit` is clean again.
+- 🖼️ **Photo descriptions were dead on both cheap providers** — vision runs on a hardcoded model per provider, and both had been retired out from under it: Ollama Cloud answered `410 gemma3:12b was retired at 2026-07-15`, OpenCode Go answered `401 Model gemini-3-flash is not supported`. Every photo silently landed in the vault with no description. Vision now uses `gemma4:31b` (Ollama) and `qwen3.7-plus` (Go), both re-verified against the live endpoints.
+- 🤖 **Kimi K3 in the model lists** — the new 1M-context Moonshot model is offered by `/model` and `iva config` on all three key-based providers: `kimi-k3` on OpenCode Go and Ollama Cloud, `moonshotai/kimi-k3` on OpenRouter (replacing the older `kimi-k2`). The offline fallback lists were re-synced with the live catalogs while we were there — Go gained `minimax-m3` and `grok-4.5`, and the Ollama list dropped two ids that provider never actually served (`qwen3.7-max`, `gemma3:12b`). Note that on Ollama Cloud `kimi-k3` bills as extra usage on top of the plan: with an empty extra balance it returns `402`.
+- ✅ **Every pull request now runs the release gate** (#61) - Node 24 tests, typecheck, Eve build, autograph tests, userbot guardrails and whitespace checks run in GitHub Actions before merge.
+
+[0.3.5]: https://github.com/smixs/iva/releases/tag/v0.3.5
+
 ## [0.3.4] - 2026-07-28
 
 Fix: memory cards survive updates, recovery targets the right Telegram conversation, thinking controls work across cloud providers, and private routes and files are locked down. Big thanks to the contributors whose reports and patches drove this release: [@AndyShaman](https://github.com/AndyShaman) (#34, #35, #36, #38, #42, #43 - the recovery fixes #35/#42 are merged with his authorship) and [@yakovmakovets](https://github.com/yakovmakovets) (#37, #39).

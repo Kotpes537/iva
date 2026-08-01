@@ -44,9 +44,33 @@ export interface SanitizeResult {
   blocked: boolean;
   reason: string;
   flags: string[]; // мягкие сигналы (не блок): invisible/lookalikes/role/override
+  truncatedChars: number; // число Unicode-кодпоинтов, снятых только защитным hard cap
+}
+
+const INBOUND_ATTACK_FLAG_NAMES = new Set(["role-markers", "overrides"]);
+
+/**
+ * Decide whether sanitized inbound data needs an explicit model-visible warning.
+ *
+ * Some sanitizer flags only describe harmless cleanup/detection, for example
+ * Cyrillic lookalikes. Role markers and override attempts carry instruction-like
+ * semantics even below the hard-block threshold.
+ */
+export function hasInboundAttackSignal(
+  result: Pick<SanitizeResult, "blocked" | "flags">,
+): boolean {
+  if (result.blocked) return true;
+  return result.flags.some((flag) => {
+    const separator = flag.indexOf("=");
+    const name = separator === -1 ? flag : flag.slice(0, separator);
+    return INBOUND_ATTACK_FLAG_NAMES.has(name);
+  });
 }
 
 export function sanitizeInbound(input: string, maxChars = 50000): SanitizeResult {
+  if (!Number.isSafeInteger(maxChars) || maxChars < 0) {
+    throw new RangeError("maxChars must be a non-negative safe integer");
+  }
   const originalLen = input.length;
   const flags: string[] = [];
 
@@ -63,6 +87,7 @@ export function sanitizeInbound(input: string, maxChars = 50000): SanitizeResult
       blocked: true,
       reason: `Excessive invisible characters: ${invisibleRemoved} (${Math.floor((invisibleRemoved * 100) / originalLen)}%)`,
       flags: ["invisible-flood"],
+      truncatedChars: 0,
     };
   }
   if (invisibleRemoved) flags.push(`invisible=${invisibleRemoved}`);
@@ -79,6 +104,7 @@ export function sanitizeInbound(input: string, maxChars = 50000): SanitizeResult
       blocked: true,
       reason: `Wallet drain attempt: ${walletRemoved} expensive Unicode chars`,
       flags: ["wallet-drain"],
+      truncatedChars: 0,
     };
   }
 
@@ -103,8 +129,19 @@ export function sanitizeInbound(input: string, maxChars = 50000): SanitizeResult
   if (roleMarkers) flags.push(`role-markers=${roleMarkers}`);
   if (overrides) flags.push(`overrides=${overrides}`);
 
-  // 5. Hard char cap.
-  if (text.length > maxChars) text = text.slice(0, maxChars);
+  // 5. Hard char cap. Count Unicode code points and slice only at a code-point
+  // boundary: String.slice(maxChars) uses UTF-16 code units and can leave half
+  // an emoji in model context.
+  let codePoints = 0;
+  let keptCodeUnits = text.length;
+  for (let offset = 0; offset < text.length;) {
+    if (codePoints === maxChars) keptCodeUnits = offset;
+    const point = text.codePointAt(offset);
+    offset += point !== undefined && point > 0xffff ? 2 : 1;
+    codePoints += 1;
+  }
+  const truncatedChars = Math.max(0, codePoints - maxChars);
+  if (truncatedChars > 0) text = text.slice(0, keptCodeUnits);
 
   // Блок только при явной инъекции: (роли≥2 И override≥1) ИЛИ override≥3.
   if ((roleMarkers >= 2 && overrides >= 1) || overrides >= 3) {
@@ -113,9 +150,10 @@ export function sanitizeInbound(input: string, maxChars = 50000): SanitizeResult
       blocked: true,
       reason: `Prompt injection: ${roleMarkers} role markers, ${overrides} override attempts`,
       flags,
+      truncatedChars,
     };
   }
-  return { text, blocked: false, reason: "clean", flags };
+  return { text, blocked: false, reason: "clean", flags, truncatedChars };
 }
 
 // --- OUTBOUND: утечка секретов / эксфильтрация -----------------------------------------------

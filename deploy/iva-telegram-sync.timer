@@ -1,0 +1,10 @@
+[Unit]
+Description=Iva work Telegram sync — 05:00 Europe/Minsk
+
+[Timer]
+OnCalendar=*-*-* 05:00:00 Europe/Minsk
+Persistent=true
+Unit=iva-telegram-sync.service
+
+[Install]
+WantedBy=timers.target

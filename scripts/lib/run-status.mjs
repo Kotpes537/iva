@@ -14,6 +14,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   statSync,
@@ -156,6 +157,30 @@ export function getChatStatus(chatKey) {
   return readCurrent(chatKey);
 }
 
+// Снимок всех per-chat записей для фонового обслуживания мостом.
+// Служебные lock/tmp/corrupt файлы и legacy whole-map сюда не попадают.
+export function listChatStatuses() {
+  let names;
+  try {
+    names = readdirSync(STATUS_DIR);
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+
+  const records = [];
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const encoded = name.slice(0, -".json".length);
+    if (encoded.length === 0) continue;
+    const chatKey = Buffer.from(encoded, "base64url").toString("utf8");
+    if (statusFileOf(chatKey) !== join(STATUS_DIR, name)) continue;
+    const value = readPerChat(chatKey);
+    if (value) records.push({ chatKey, status: value });
+  }
+  return records;
+}
+
 // true, когда по chatKey реально идёт ход (running и не протух).
 export function isRunning(chatKey, now = Date.now()) {
   const st = getChatStatus(chatKey);
@@ -176,7 +201,16 @@ function updateChatStatus(chatKey, patch, expected) {
     ) {
       return null;
     }
-    const next = { ...prev, ...patch, updatedAt: Date.now() };
+    const previousGeneration =
+      Number.isSafeInteger(prev.generation) && prev.generation >= 0
+        ? prev.generation
+        : 0;
+    const next = {
+      ...prev,
+      ...patch,
+      generation: previousGeneration + 1,
+      updatedAt: Date.now(),
+    };
     for (const key of Object.keys(next)) if (next[key] === null) delete next[key];
     writeCurrent(file, next);
     return next;
