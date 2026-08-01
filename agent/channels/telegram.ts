@@ -115,6 +115,20 @@ function messageViewForRaw(message: any, raw: TelegramRawMessage): any {
   };
 }
 
+function locationContext(raw: TelegramRawMessage): string | null {
+  const location = raw.location;
+  if (!location) return null;
+  const latitude = Number(location.latitude);
+  const longitude = Number(location.longitude);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+  return (
+    `[Telegram location] The user shared coordinates: ${latitude}, ${longitude}. ` +
+    "Use them for the current request, such as weather or routing. Do not add exact " +
+    "coordinates to CORE memory or share them unless the user explicitly asks. If there " +
+    "is no question yet, acknowledge receipt and ask what to do."
+  );
+}
+
 // Воспроизводит дефолтный auth-контекст eve для Telegram-актора.
 function buildAuth(msg: any) {
   const u = msg.from;
@@ -1058,6 +1072,12 @@ const telegram = telegramChannel({
     if (partsRaw.length === 1) {
       const userText = (message.text || "").trim();
       const userDailyPath = userText ? appendDaily("[text]", userText) : undefined;
+      const location = locationContext(raw);
+
+      if (!userText && location) {
+        await ctx.telegram.startTyping();
+        return withPre({ auth: buildAuth(message), context: [location] });
+      }
 
       await ctx.telegram.startTyping();
 
@@ -1078,15 +1098,23 @@ const telegram = telegramChannel({
           const notice = inboundTruncationNotice(s, userDailyPath);
           const context = s.blocked ? [warn, s.text] : [s.text];
           if (notice) context.push(notice);
-          return withPre({ auth: buildAuth(message), context });
+          return withPre({
+            auth: buildAuth(message),
+            context: location ? [location, ...context] : context,
+          });
         }
       }
-      return withPre({ auth: buildAuth(message) });
+      return withPre({
+        auth: buildAuth(message),
+        ...(location ? { context: [location] } : {}),
+      });
     }
 
     await ctx.telegram.startTyping();
     const context: string[] = [];
     for (const [partIndex, partRaw] of partsRaw.entries()) {
+      const location = locationContext(partRaw);
+      if (location) context.push(location);
       const partMedia = mediaFromRaw(partRaw);
       if (partMedia) {
         const result = await processMediaPart(ctx, partRaw, partMedia);

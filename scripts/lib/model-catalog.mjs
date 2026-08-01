@@ -57,6 +57,15 @@ export const CATALOG = {
       "grok-4.5",
     ],
   },
+  deepseek: {
+    label: "DeepSeek",
+    auth: "key",
+    base: "https://api.deepseek.com",
+    keyVar: "DEEPSEEK_API_KEY",
+    modelVar: "DEEPSEEK_MODEL",
+    def: "deepseek-v4-flash",
+    models: ["deepseek-v4-flash", "deepseek-v4-pro"],
+  },
   codex: {
     label: "OpenAI (подписка)",
     auth: "oauth",

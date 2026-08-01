@@ -36,6 +36,13 @@ const PROVIDERS = {
     // уходит в reasoning, у mimo-v2.5 content пустой — vision.ts читает только content.
     visionModel: "qwen3.7-plus",
   },
+  deepseek: {
+    baseURL: "https://api.deepseek.com",
+    apiKey: process.env.DEEPSEEK_API_KEY,
+    textModel: process.env.DEEPSEEK_MODEL ?? "deepseek-v4-flash",
+    contextWindow: Number(process.env.DEEPSEEK_CONTEXT_WINDOW ?? 131072),
+    visionModel: "",
+  },
   openrouter: {
     baseURL: "https://openrouter.ai/api/v1",
     apiKey: process.env.OPENROUTER_API_KEY,

@@ -1,6 +1,7 @@
 const PROVIDERS = {
   ollama: { label: "Ollama", model: "OLLAMA_MODEL", context: "OLLAMA_CONTEXT_WINDOW" },
   opencode: { label: "OpenCode", model: "OPENCODE_MODEL", context: "OPENCODE_CONTEXT_WINDOW" },
+  deepseek: { label: "DeepSeek", model: "DEEPSEEK_MODEL", context: "DEEPSEEK_CONTEXT_WINDOW" },
   openrouter: { label: "OpenRouter", model: "OPENROUTER_MODEL", context: "OPENROUTER_CONTEXT_WINDOW" },
   codex: { label: "OpenAI", model: "CODEX_MODEL", context: "CODEX_CONTEXT_WINDOW" },
 };
