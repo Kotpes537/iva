@@ -16,6 +16,8 @@ interface Task {
   priority: Priority;
   due: string | null;
   dueAt: string | null;
+  startAt?: string | null;
+  startAlertDays?: number[];
   done: boolean;
   createdAt: string;
 }
@@ -29,6 +31,12 @@ function normalizeDueAt(value?: string): string | null {
   const date = new Date(raw);
   if (Number.isNaN(date.getTime())) throw new Error("dueAt содержит некорректную дату");
   return date.toISOString();
+}
+
+function normalizeStartAlertDays(value: number[] | undefined, startAt: string | null): number[] {
+  if (!startAt) return [];
+  const days = value === undefined ? [7, 3, 1] : value;
+  return [...new Set(days)].sort((a, b) => b - a);
 }
 
 // Нет файла → []. Битый JSON — НЕ пустой список: loadJsonStrict откладывает бэкап и
@@ -47,10 +55,13 @@ export default defineTool({
     id: z.number().int().positive().optional().describe("ID задачи (для done/remove)"),
     priority: z.enum(["low", "med", "high"]).optional().describe("Приоритет (для add)"),
     due: z.string().optional().describe("Срок для показа пользователю (для add)"),
-    dueAt: z.string().optional().describe("Точный срок в ISO 8601 с часовым поясом для алертов просрочки"),
+    dueAt: z.string().optional().describe("Точный срок в ISO 8601 с часовым поясом: алерт за 48 часов и просрочка"),
+    startAt: z.string().optional().describe("Точная дата и время старта важной механики в ISO 8601 с часовым поясом"),
+    startAlertDays: z.array(z.number().int().min(0).max(30)).max(6).optional()
+      .describe("За сколько календарных дней напомнить о старте: например [7,3,1]. По умолчанию [7,3,1]"),
     includeDone: z.boolean().optional().describe("Показать и выполненные (для list)"),
   }),
-  async execute({ action, text, id, priority, due, dueAt, includeDone }) {
+  async execute({ action, text, id, priority, due, dueAt, startAt, startAlertDays, includeDone }) {
     // Мутации — под локом: параллельный ход (расписание + живой чат) на голом
     // load→mutate→save терял записи и дублировал id (id = max+1 от своей копии).
     let lockToken: string | null = null;
@@ -62,7 +73,7 @@ export default defineTool({
       }
     }
     try {
-      return await run({ action, text, id, priority, due, dueAt, includeDone });
+      return await run({ action, text, id, priority, due, dueAt, startAt, startAlertDays, includeDone });
     } catch (e) {
       return { ok: false, error: (e as Error).message };
     } finally {
@@ -78,10 +89,12 @@ type Args = {
   priority?: Priority;
   due?: string;
   dueAt?: string;
+  startAt?: string;
+  startAlertDays?: number[];
   includeDone?: boolean;
 };
 
-async function run({ action, text, id, priority, due, dueAt, includeDone }: Args) {
+async function run({ action, text, id, priority, due, dueAt, startAt, startAlertDays, includeDone }: Args) {
   const tasks = await load();
 
   switch (action) {
@@ -94,6 +107,8 @@ async function run({ action, text, id, priority, due, dueAt, includeDone }: Args
           priority: priority ?? "med",
           due: due ?? null,
           dueAt: normalizeDueAt(dueAt),
+          startAt: normalizeDueAt(startAt),
+          startAlertDays: normalizeStartAlertDays(startAlertDays, normalizeDueAt(startAt)),
           done: false,
           createdAt: new Date().toISOString(),
         };
@@ -113,6 +128,10 @@ async function run({ action, text, id, priority, due, dueAt, includeDone }: Args
         if (priority !== undefined) t.priority = priority;
         if (due !== undefined) t.due = due || null;
         if (dueAt !== undefined) t.dueAt = normalizeDueAt(dueAt);
+        if (startAt !== undefined) t.startAt = normalizeDueAt(startAt);
+        if (startAlertDays !== undefined || startAt !== undefined) {
+          t.startAlertDays = normalizeStartAlertDays(startAlertDays ?? t.startAlertDays, t.startAt ?? null);
+        }
         await save(tasks);
         return { ok: true, updated: t };
       }
