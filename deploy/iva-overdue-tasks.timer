@@ -1,0 +1,10 @@
+[Unit]
+Description=Iva overdue task alert at 08:35
+
+[Timer]
+OnCalendar=*-*-* 08:35:00 __TIMEZONE__
+Persistent=true
+Unit=iva-overdue-tasks.service
+
+[Install]
+WantedBy=timers.target

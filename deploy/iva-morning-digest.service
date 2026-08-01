@@ -1,0 +1,13 @@
+[Unit]
+Description=Iva morning digest
+After=network-online.target iva.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__PROJECT_DIR__
+EnvironmentFile=__PROJECT_DIR__/.env
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Nice=10
+CPUQuota=35%
+MemoryMax=512M
+ExecStart=__NODE_BIN__ --env-file=.env scripts/daily-digest.ts

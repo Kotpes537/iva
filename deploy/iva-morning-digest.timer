@@ -1,0 +1,10 @@
+[Unit]
+Description=Iva morning digest at 08:30
+
+[Timer]
+OnCalendar=*-*-* 08:30:00 __TIMEZONE__
+Persistent=true
+Unit=iva-morning-digest.service
+
+[Install]
+WantedBy=timers.target

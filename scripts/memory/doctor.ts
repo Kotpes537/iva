@@ -115,6 +115,8 @@ maint("cleanup", [`${SCRIPTS}/cleanup.py`, ".", "--apply"]);
 maint("enforce", [`${SCRIPTS}/enforce.py`, ".", SCHEMA, "--apply"]);
 // graph.health rebuilds the graph and writes health-history.json (for drop detection).
 maint("graph.health", [`${SCRIPTS}/graph.py`, "health", "."]);
+// Only resolves deterministic, unique broken-link targets. Ambiguous links stay untouched.
+maint("graph.fix", [`${SCRIPTS}/graph.py`, "fix", ".", "--apply"]);
 // engine.decay updates card relevance/tiers.
 maint("engine.decay", [`${SCRIPTS}/engine.py`, "decay", "."]);
 // moc.generate rebuilds the MOC indexes.

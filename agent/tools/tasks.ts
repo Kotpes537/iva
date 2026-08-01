@@ -15,8 +15,20 @@ interface Task {
   text: string;
   priority: Priority;
   due: string | null;
+  dueAt: string | null;
   done: boolean;
   createdAt: string;
+}
+
+function normalizeDueAt(value?: string): string | null {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw)) {
+    throw new Error("dueAt должен быть ISO-датой с часовым поясом");
+  }
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) throw new Error("dueAt содержит некорректную дату");
+  return date.toISOString();
 }
 
 // Нет файла → []. Битый JSON — НЕ пустой список: loadJsonStrict откладывает бэкап и
@@ -34,10 +46,11 @@ export default defineTool({
     text: z.string().min(1).optional().describe("Текст задачи (для action=add)"),
     id: z.number().int().positive().optional().describe("ID задачи (для done/remove)"),
     priority: z.enum(["low", "med", "high"]).optional().describe("Приоритет (для add)"),
-    due: z.string().optional().describe("Срок в свободной форме или ISO-дата (для add)"),
+    due: z.string().optional().describe("Срок для показа пользователю (для add)"),
+    dueAt: z.string().optional().describe("Точный срок в ISO 8601 с часовым поясом для алертов просрочки"),
     includeDone: z.boolean().optional().describe("Показать и выполненные (для list)"),
   }),
-  async execute({ action, text, id, priority, due, includeDone }) {
+  async execute({ action, text, id, priority, due, dueAt, includeDone }) {
     // Мутации — под локом: параллельный ход (расписание + живой чат) на голом
     // load→mutate→save терял записи и дублировал id (id = max+1 от своей копии).
     let lockToken: string | null = null;
@@ -49,7 +62,7 @@ export default defineTool({
       }
     }
     try {
-      return await run({ action, text, id, priority, due, includeDone });
+      return await run({ action, text, id, priority, due, dueAt, includeDone });
     } catch (e) {
       return { ok: false, error: (e as Error).message };
     } finally {
@@ -64,10 +77,11 @@ type Args = {
   id?: number;
   priority?: Priority;
   due?: string;
+  dueAt?: string;
   includeDone?: boolean;
 };
 
-async function run({ action, text, id, priority, due, includeDone }: Args) {
+async function run({ action, text, id, priority, due, dueAt, includeDone }: Args) {
   const tasks = await load();
 
   switch (action) {
@@ -79,6 +93,7 @@ async function run({ action, text, id, priority, due, includeDone }: Args) {
           text,
           priority: priority ?? "med",
           due: due ?? null,
+          dueAt: normalizeDueAt(dueAt),
           done: false,
           createdAt: new Date().toISOString(),
         };

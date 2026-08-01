@@ -49,7 +49,8 @@ const MEMORY_PERIODS = ["daily", "weekly", "monthly", "yearly", "doctor"];
 const MEMORY_SERVICES = MEMORY_PERIODS.map((n) => `iva-memory-${n}.service`);
 const MEMORY_TIMERS = MEMORY_PERIODS.map((n) => `iva-memory-${n}.timer`);
 const UPDATE_TIMER = "iva-update-check.timer";
-const TIMERS = [...MEMORY_TIMERS, UPDATE_TIMER];
+const PRODUCTIVITY_TIMERS = ["iva-morning-digest.timer", "iva-overdue-tasks.timer"];
+const TIMERS = [...MEMORY_TIMERS, UPDATE_TIMER, ...PRODUCTIVITY_TIMERS];
 
 // Telegram userbot proxy — OPT-IN (not in SERVICES, so `iva update` never tries to start
 // it without API creds). Enabled explicitly via `iva userbot setup`.

@@ -5,6 +5,8 @@
 //
 // Requires: a running agent (eve start) and the TELEGRAM_BOT_TOKEN, TELEGRAM_DIGEST_CHAT_ID variables.
 import { Client } from "eve/client";
+import { readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { sendTelegramHtml } from "./lib/telegram-send.mjs";
 
 const PORT = process.env.IVA_PORT ?? "8723";
@@ -12,6 +14,17 @@ const HOST = process.env.ASSISTANT_HOST ?? `http://127.0.0.1:${PORT}`;
 const BOT = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT = process.env.TELEGRAM_DIGEST_CHAT_ID;
 const BEARER = process.env.ASSISTANT_BEARER; // needed if the eve channel in prod requires auth
+const ROOT = resolve(import.meta.dirname, "..");
+const DATA_DIR = process.env.ASSISTANT_DATA_DIR ?? join(ROOT, "data");
+
+function lastSyncSummary() {
+  try {
+    const state = JSON.parse(readFileSync(join(DATA_DIR, "telegram-sync-status.json"), "utf8"));
+    return typeof state.summary === "string" ? state.summary.slice(0, 3000) : "Нет данных о последнем сборе рабочих чатов.";
+  } catch {
+    return "Нет данных о последнем сборе рабочих чатов.";
+  }
+}
 
 if (!BOT || !CHAT) {
   console.error("TELEGRAM_BOT_TOKEN and TELEGRAM_DIGEST_CHAT_ID are required");
@@ -25,7 +38,11 @@ const client = new Client({
 
 const session = client.session();
 const response = await session.send(
-  "Load the morning-digest skill and build the morning digest for my tasks. " +
+    "Load the morning-digest skill and build the morning digest for my tasks. " +
+    "Include a very short section named 'Рабочие чаты' based only on this last successful sync summary; " +
+    "If it contains TASK_CANDIDATES, show them in a separate 'Кандидаты задач' section and state that they require confirmation; never create tasks from them. " +
+    "do not call the Telegram userbot, do not read more chats, and do not invent updates. " +
+    `Last sync summary:\n${lastSyncSummary()}\n\n` +
     "Return only the finished digest text, no preamble.",
 );
 const result = await response.result();

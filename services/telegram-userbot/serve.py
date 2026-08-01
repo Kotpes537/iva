@@ -176,7 +176,17 @@ def main() -> None:
     # that breaks MCP's streamable transport and can spin CPU. Instead, only the
     # required tools exist, and every content tool rejects a non-allowlisted chat.
     def allowed_chat_ids() -> set[str]:
+        # EnvironmentFile is read once by systemd. Read this one non-secret setting
+        # from the current project .env on each call so an allowlist update becomes
+        # effective immediately and cannot drift from the nightly sync service.
         raw = os.getenv("TELEGRAM_MCP_ALLOWED_CHAT_IDS", "")
+        try:
+            for line in (Path(__file__).resolve().parents[2] / ".env").read_text(encoding="utf-8").splitlines():
+                if line.startswith("TELEGRAM_MCP_ALLOWED_CHAT_IDS="):
+                    raw = line.split("=", 1)[1].strip().strip('"\'')
+                    break
+        except OSError:
+            pass
         return {value.strip() for value in raw.replace(";", ",").split(",") if value.strip()}
 
     discovery = os.getenv("TELEGRAM_MCP_DISCOVERY_ONLY", "0") == "1"

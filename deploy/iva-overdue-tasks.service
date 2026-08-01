@@ -1,0 +1,13 @@
+[Unit]
+Description=Iva overdue task alert
+After=network-online.target telegram-bot-api.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__PROJECT_DIR__
+EnvironmentFile=__PROJECT_DIR__/.env
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Nice=10
+CPUQuota=20%
+MemoryMax=128M
+ExecStart=__NODE_BIN__ --env-file=.env scripts/tasks/overdue-tasks.mjs
