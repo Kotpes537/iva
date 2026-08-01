@@ -79,6 +79,13 @@ export const COMMANDS = [
   { command: "task", en: "add a task", ru: "добавить задачу", args: { en: "<text>", ru: "<текст>" } },
   { command: "tasks", en: "show tasks", ru: "показать задачи" },
   { command: "digest", en: "morning digest", ru: "утренний дайджест" },
+  { command: "health", en: "service and queue health", ru: "состояние сервисов и очереди" },
+  { command: "queue", en: "show or clear the durable queue", ru: "показать или очистить очередь" },
+  { command: "chats", en: "configured work chats", ru: "настроенные рабочие чаты" },
+  { command: "sync", en: "sync work chats into memory", ru: "синхронизировать рабочие чаты" },
+  { command: "reminders", en: "active reminders", ru: "активные напоминания" },
+  { command: "memory", en: "memory status or today's log", ru: "состояние памяти или журнал за сегодня" },
+  { command: "forget", en: "move a card to reversible trash", ru: "переместить карточку в обратимую корзину", args: { en: "<card path>", ru: "<путь карточки>" } },
 ];
 
 // Текст /help на текущем языке. Генерится на каждый вызов (язык мог смениться).

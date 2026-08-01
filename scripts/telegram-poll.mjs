@@ -11,7 +11,7 @@
 import { readFile, writeFile, mkdir, rm, readdir, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { execFile } from "node:child_process";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import { readEntries, summarize, formatUsageReport, parseWindow } from "./lib/usage.mjs";
@@ -84,6 +84,7 @@ import { getLang, tr, helpText, botCommands } from "./lib/i18n.mjs";
 import { createFlows } from "./lib/tg-flow.mjs";
 // Движок вложенного inline-меню (/menu) — весь UI настроек в мосте, out-of-band.
 import { createMenu } from "./lib/menu/index.mjs";
+import { createTelegramOps } from "./lib/telegram-ops.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const NODE = process.execPath;
@@ -1763,6 +1764,14 @@ const menu = createMenu({
   },
 });
 
+const telegramOps = createTelegramOps({
+  dataDir: DATA_DIR,
+  vault: resolve(ROOT, process.env.ASSISTANT_VAULT_DIR ?? "vault"),
+  allowed: ALLOWED,
+  reply,
+  tr,
+});
+
 // setMyCommands: синее командное меню Telegram из общей таблицы COMMANDS (default=en +
 // language_code:"ru"). Идемпотентно, зовётся на каждом старте моста; ошибки нефатальны.
 async function registerBotCommands() {
@@ -1896,10 +1905,11 @@ async function handleControl(update) {
   }
   if (!text.startsWith("/")) return false;
   const cmd = text.split(/\s+/)[0].replace(/@\w+$/, "").toLowerCase();
-  if (!["/menu", "/help", "/stop", "/usage", "/restart", "/new", "/update", "/model", "/think"].includes(cmd)) return false;
+  if (!["/menu", "/help", "/stop", "/usage", "/restart", "/new", "/update", "/model", "/think", "/health", "/queue", "/chats", "/sync", "/reminders", "/memory", "/forget"].includes(cmd)) return false;
   const from = String(msg?.from?.id ?? "");
   if (ALLOWED.size === 0 || !ALLOWED.has(from)) return false; // untrusted — let eve drop it
   const chatId = msg?.chat?.id;
+  if (await telegramOps.handle(update)) return true;
   // /menu — open the nested settings menu (out-of-band; errors consumed, never reach eve).
   if (cmd === "/menu") {
     await menu.open(chatId, from).catch((e) => log("menu error:", e.message));

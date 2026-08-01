@@ -4,6 +4,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client, type SessionState } from "eve/client";
+import { TELEGRAM_SYNC_CHATS } from "../lib/telegram-sync-config.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DATA_DIR = process.env.ASSISTANT_DATA_DIR ?? join(ROOT, "data");
@@ -14,13 +15,7 @@ const BEARER = process.env.ASSISTANT_BEARER;
 const SESSION_FILE = join(DATA_DIR, "telegram-sync-session.json");
 const WATERMARK_FILE = join(DATA_DIR, "telegram-sync-watermark.json");
 
-const CHATS = [
-  ["-5020893711", "AI assist"],
-  ["-5089442250", "CRM Еплюс"],
-  ["-5094503913", "Без ИА"],
-  ["-5091064861", "Клубы Евроопт"],
-  ["-5538028235", "КСО_рабочая группа"],
-] as const;
+const CHATS = TELEGRAM_SYNC_CHATS as unknown as readonly [string, string][];
 
 type Cursor = { state: SessionState; createdAt: number };
 type Watermark = { chats: Record<string, number> };
