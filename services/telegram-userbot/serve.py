@@ -27,8 +27,13 @@ Env:
                          (default $ASSISTANT_DATA_DIR/telegram-userbot.session, else ./telegram-userbot.session)
 """
 import os
+import json
+import re
+import shutil
 import sys
+import time
 from pathlib import Path
+from typing import Optional, Union
 
 
 async def _health_payload(client) -> dict[str, str]:
@@ -55,6 +60,38 @@ def _token_file() -> Path:
     # (cwd = services/telegram-userbot) resolve the SAME file: services/telegram-userbot/
     # serve.py → parents[2] = iva root. `iva userbot setup` writes it (0600).
     return Path(__file__).resolve().parents[2] / "data" / "telegram-userbot.token"
+
+
+def _download_root() -> Path:
+    """Private local destination for read-only large Telegram media downloads."""
+    root = Path(__file__).resolve().parents[2]
+    configured = Path(os.getenv("TELEGRAM_MCP_DOWNLOAD_DIR", "vault/telegram-media"))
+    if not configured.is_absolute():
+        configured = root / configured
+    configured.mkdir(parents=True, mode=0o700, exist_ok=True)
+    try:
+        configured.chmod(0o700)
+    except OSError:
+        pass
+    return configured.resolve()
+
+
+def _download_limit() -> int:
+    # A 2 GB default fits the current VPS better than Telegram's account limit.
+    raw = os.getenv("TELEGRAM_MCP_MAX_DOWNLOAD_BYTES", str(2 * 1024 * 1024 * 1024))
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 2 * 1024 * 1024 * 1024
+    return max(1, min(value, 4 * 1024 * 1024 * 1024))
+
+
+def _safe_download_name(raw: Optional[str], chat_id: Union[int, str], message_id: int) -> str:
+    candidate = Path(str(raw or "")).name if raw else ""
+    candidate = re.sub(r"[^0-9A-Za-zА-Яа-я._ -]+", "_", candidate).strip(" .")
+    if not candidate:
+        candidate = f"telegram_{chat_id}_{message_id}_{int(time.time())}"
+    return candidate[:180]
 
 
 def _resolve_token() -> str:
@@ -106,7 +143,13 @@ def main() -> None:
 
     # Import AFTER seeding the session env — runtime builds `mcp` + the single
     # Telethon client; importing the tools package fires every @mcp.tool decorator.
-    from telegram_mcp.runtime import mcp, get_client, _apply_exposed_tools_mode
+    from telegram_mcp.runtime import (
+        mcp,
+        get_client,
+        resolve_entity,
+        _apply_exposed_tools_mode,
+        ToolAnnotations,
+    )
     import telegram_mcp.tools  # noqa: F401 — registers all tools with `mcp`
 
     # Honor TELEGRAM_EXPOSED_TOOLS (e.g. "read-only"); upstream normally does this in
@@ -181,6 +224,93 @@ def main() -> None:
             return await __original(*args, **kwargs)
 
         tool.fn = guarded
+
+    # The upstream download_media tool is disabled in read-only exposure because it
+    # writes to a client-selected path. This narrower tool is read-only with respect
+    # to Telegram and writes only inside vault/telegram-media on this VPS.
+    download_root = _download_root()
+    max_download_bytes = _download_limit()
+
+    class _DownloadLimitExceeded(Exception):
+        pass
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            title="Download Telegram media to vault",
+            openWorldHint=False,
+            destructiveHint=False,
+        )
+    )
+    async def download_media_to_vault(
+        chat_id: Union[int, str],
+        message_id: int,
+        filename: Optional[str] = None,
+        account: str = None,
+    ) -> str:
+        """
+        Download a media attachment from an allowlisted Telegram chat into the
+        server's vault/telegram-media directory. This tool never sends or edits
+        Telegram messages. Use it when Bot API cannot download a file over 20 MB.
+        The default maximum is 2 GiB and the file is streamed to disk.
+        """
+        if str(chat_id) not in allowed_chat_ids():
+            return "Telegram MCP: chat is not in the configured allowlist."
+        try:
+            message_id = int(message_id)
+        except (TypeError, ValueError):
+            return "message_id must be an integer."
+        if message_id <= 0:
+            return "message_id must be positive."
+
+        try:
+            cl = get_client(account or "default")
+            entity = await resolve_entity(chat_id, cl)
+            msg = await cl.get_messages(entity, ids=message_id)
+            if not msg or not msg.media:
+                return "No media found in the specified message."
+
+            declared_size = getattr(getattr(msg, "file", None), "size", None)
+            if isinstance(declared_size, int) and declared_size > max_download_bytes:
+                return (
+                    f"File is too large: {declared_size} bytes; "
+                    f"configured limit is {max_download_bytes} bytes."
+                )
+
+            free_bytes = shutil.disk_usage(download_root).free
+            if isinstance(declared_size, int) and declared_size > int(free_bytes * 0.9):
+                return "Not enough free disk space for a safe download."
+
+            name = _safe_download_name(filename or getattr(getattr(msg, "file", None), "name", None), chat_id, message_id)
+            target_prefix = (download_root / name).with_suffix("")
+
+            def progress(current: int, total: int) -> None:
+                if current > max_download_bytes or current > int(shutil.disk_usage(download_root).free * 0.9):
+                    raise _DownloadLimitExceeded("download limit or free-space guard reached")
+
+            downloaded = await cl.download_media(msg, file=str(target_prefix), progress_callback=progress)
+            if not downloaded:
+                return f"Download failed for message {message_id}."
+            final_path = Path(downloaded).resolve(strict=True)
+            if not final_path.is_relative_to(download_root):
+                try:
+                    final_path.unlink()
+                except OSError:
+                    pass
+                return "Download failed: resulting path is outside the vault media directory."
+            return json.dumps(
+                {
+                    "ok": True,
+                    "path": str(final_path),
+                    "size": final_path.stat().st_size,
+                    "chat_id": str(chat_id),
+                    "message_id": message_id,
+                },
+                ensure_ascii=False,
+            )
+        except _DownloadLimitExceeded as exc:
+            return f"Download stopped by safety limit: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            return f"download_media_to_vault failed: {type(exc).__name__}: {exc}"
 
 
     import uvicorn
