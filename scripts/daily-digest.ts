@@ -17,12 +17,23 @@ const BEARER = process.env.ASSISTANT_BEARER; // needed if the eve channel in pro
 const ROOT = resolve(import.meta.dirname, "..");
 const DATA_DIR = process.env.ASSISTANT_DATA_DIR ?? join(ROOT, "data");
 
-function lastSyncSummary() {
+type TaskCandidate = { text: string; source: string };
+function isTaskCandidate(item: unknown): item is TaskCandidate {
+  return typeof item === "object" && item !== null &&
+    typeof (item as TaskCandidate).text === "string" && typeof (item as TaskCandidate).source === "string";
+}
+
+function lastSyncCandidates() {
   try {
     const state = JSON.parse(readFileSync(join(DATA_DIR, "telegram-sync-status.json"), "utf8"));
-    return typeof state.summary === "string" ? state.summary.slice(0, 3000) : "Нет данных о последнем сборе рабочих чатов.";
+    if (!Array.isArray(state.taskCandidates)) return [];
+    const candidates: unknown[] = state.taskCandidates;
+    return candidates
+      .filter(isTaskCandidate)
+      .slice(0, 5)
+      .map((item) => ({ text: item.text.slice(0, 400), source: item.source.slice(0, 120) }));
   } catch {
-    return "Нет данных о последнем сборе рабочих чатов.";
+    return [];
   }
 }
 
@@ -39,10 +50,11 @@ const client = new Client({
 const session = client.session();
 const response = await session.send(
     "Load the morning-digest skill and build the morning digest for my tasks. " +
-    "Include a very short section named 'Рабочие чаты' based only on this last successful sync summary; " +
-    "If it contains TASK_CANDIDATES, show them in a separate 'Кандидаты задач' section and state that they require confirmation; never create tasks from them. " +
+    "Use this structured list of task candidates from the last nightly chat sync. " +
+    "Only if the list is non-empty, show a compact section named 'Кандидаты задач': one bullet per candidate with its source and a note that each requires confirmation. " +
+    "Never create or change a task from candidates. Do not mention chat summaries, new messages, sync status, or chats with no candidates. " +
     "do not call the Telegram userbot, do not read more chats, and do not invent updates. " +
-    `Last sync summary:\n${lastSyncSummary()}\n\n` +
+    "Task candidates: " + JSON.stringify(lastSyncCandidates()) + "\n\n" +
     "Return only the finished digest text, no preamble.",
 );
 const result = await response.result();
