@@ -39,10 +39,10 @@ const save = (tasks: Task[]) => saveJsonAtomic(FILE, tasks);
 export default defineTool({
   description:
     "Управление списком задач пользователя. action=add добавляет задачу (нужен text); " +
-    "list показывает задачи (по умолчанию незавершённые); done отмечает задачу выполненной (нужен id); " +
+    "list показывает задачи (по умолчанию незавершённые); update меняет поля задачи (нужен id); done отмечает задачу выполненной (нужен id); " +
     "remove удаляет задачу (нужен id).",
   inputSchema: z.object({
-    action: z.enum(["add", "list", "done", "remove"]),
+    action: z.enum(["add", "list", "update", "done", "remove"]),
     text: z.string().min(1).optional().describe("Текст задачи (для action=add)"),
     id: z.number().int().positive().optional().describe("ID задачи (для done/remove)"),
     priority: z.enum(["low", "med", "high"]).optional().describe("Приоритет (для add)"),
@@ -72,7 +72,7 @@ export default defineTool({
 });
 
 type Args = {
-  action: "add" | "list" | "done" | "remove";
+  action: "add" | "list" | "update" | "done" | "remove";
   text?: string;
   id?: number;
   priority?: Priority;
@@ -104,6 +104,17 @@ async function run({ action, text, id, priority, due, dueAt, includeDone }: Args
       case "list": {
         const items = includeDone ? tasks : tasks.filter((t) => !t.done);
         return { ok: true, count: items.length, tasks: items };
+      }
+      case "update": {
+        if (!id) return { ok: false, error: "Для update нужен id" };
+        const t = tasks.find((x) => x.id === id);
+        if (!t) return { ok: false, error: `Задача ${id} не найдена` };
+        if (text !== undefined) t.text = text;
+        if (priority !== undefined) t.priority = priority;
+        if (due !== undefined) t.due = due || null;
+        if (dueAt !== undefined) t.dueAt = normalizeDueAt(dueAt);
+        await save(tasks);
+        return { ok: true, updated: t };
       }
       case "done": {
         if (!id) return { ok: false, error: "Для done нужен id" };
